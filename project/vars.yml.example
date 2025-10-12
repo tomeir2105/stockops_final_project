@@ -1,0 +1,4 @@
+# Example vars (no real secrets)
+GRAFANA_TOKEN: "<REPLACE_WITH_TOKEN_AT_DEPLOY_TIME>"
+INFLUXDB_ADMIN_TOKEN: "<REPLACE_WITH_TOKEN_AT_DEPLOY_TIME>"
+# Real values should live in project/group_vars/ansible_env.yml (gitignored)
