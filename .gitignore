@@ -1,0 +1,106 @@
+# ──────────────────────────────
+# Global OS / Editor Ignored Files
+# ──────────────────────────────
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
+
+# ──────────────────────────────
+# Python venvs or local testing
+# ──────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# ──────────────────────────────
+# Ansible / Local artifacts
+# ──────────────────────────────
+*.retry
+*.vault
+*.vault_pass
+*.tar.gz
+*.zip
+*.tgz
+*.tar
+*.orig
+*.bak.*
+*.cache/
+.cache/
+.tmp/
+tmp/
+log/
+logs/
+*.out
+
+# ──────────────────────────────
+# Secrets / Credentials
+# ──────────────────────────────
+project/group_vars/dockerhub.yml
+project/vars.yml
+# Keep examples tracked:
+!project/group_vars/dockerhub.yml.example
+!project/vars.yml.example
+
+# ──────────────────────────────
+# Binary / CLI Tools
+# ──────────────────────────────
+project/stage7_dashboards/influxdb2-client-2.3.0-linux-arm64/
+project/stage7_dashboards/influxdb2-client-2.3.0-linux-arm64/*
+
+# ──────────────────────────────
+# Jenkins Runtime / Cache
+# ──────────────────────────────
+jenkins_home/
+project/jenkins_home/
+*.jenkins
+*.crumb
+*.cookie
+*.session
+*.pid
+*.pid.lock
+
+# ──────────────────────────────
+# NFS / Cluster generated data
+# ──────────────────────────────
+/mnt/
+/var/
+/tmp/
+/home/*/.ansible/
+*.inventory_backup
+
+# ──────────────────────────────
+# NodePort, Kubernetes, Container Artifacts
+# ──────────────────────────────
+*.yaml.bak
+*.yml.bak
+*.bak.yaml
+*.bak.yml
+*.kubectl
+*.kubeconfig
+.kube/
+.k8s/
+
+# ──────────────────────────────
+# Misc Local Config / Router scripts output
+# ──────────────────────────────
+rpi-wifi-router/*.log
+rpi-wifi-router/config/*.conf
+rpi-wifi-router/scripts/*.log
+rpi-wifi-router/output/
+rpi-wifi-router/tmp/
+
+# ──────────────────────────────
+# End of file
+# ──────────────────────────────
+

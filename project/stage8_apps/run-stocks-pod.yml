@@ -1,0 +1,238 @@
+---
+# Play 1: Normalize registries (public pull, no DockerHub auth)
+- name: Normalize registries on all k3s nodes (remove docker.io auth)
+  hosts: k3s_server,k3s_workers
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  tasks:
+    - name: Write minimal registries.yaml with no auth
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/registries.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          mirrors:
+            docker.io:
+              endpoint:
+                - https://registry-1.docker.io
+          configs: {}
+      notify: restart k3s
+
+  handlers:
+    - name: restart k3s server
+      listen: "restart k3s"
+      ansible.builtin.service:
+        name: k3s
+        state: restarted
+      when: "'k3s_server' in group_names"
+
+    - name: restart k3s agent
+      listen: "restart k3s"
+      ansible.builtin.service:
+        name: k3s-agent
+        state: restarted
+      when: "'k3s_workers' in group_names"
+
+
+# Play 2: Deploy stocks as a Deployment (no Docker build)
+- name: Deploy stocks as a Deployment (no Docker build)
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG }}"
+
+  pre_tasks:
+    - name: Ensure python3 + k8s client libs are present
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-kubernetes
+        state: present
+        update_cache: yes
+
+    - name: Ensure NFS directory for stocks exists on NFS server
+      ansible.builtin.file:
+        path: "{{ STOCKS_NFS_PATH }}"
+        state: directory
+        owner: "{{ (APP_DIRS | selectattr('path', 'equalto', STOCKS_NFS_PATH) | first).owner }}"
+        group: "{{ (APP_DIRS | selectattr('path', 'equalto', STOCKS_NFS_PATH) | first).group }}"
+        mode:  "{{ (APP_DIRS | selectattr('path', 'equalto', STOCKS_NFS_PATH) | first).mode }}"
+      delegate_to: "{{ groups['nfs_server'][0] }}"
+      become: yes
+
+    - name: Cache stocks-dir spec from APP_DIRS
+      ansible.builtin.set_fact:
+        stocks_dir_spec: "{{ (APP_DIRS | selectattr('path','equalto', STOCKS_NFS_PATH) | first) }}"
+
+    - name: Copy app files to NFS (stocks)
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ STOCKS_NFS_PATH }}/{{ item.dest }}"
+        owner: "{{ stocks_dir_spec.owner }}"
+        group: "{{ stocks_dir_spec.group }}"
+        mode: "0644"
+      loop:
+        - { src: "{{ playbook_dir }}/../apps/stocks/app.py",           dest: "app.py" }
+        - { src: "{{ playbook_dir }}/../apps/stocks/requirements.txt", dest: "requirements.txt" }
+      delegate_to: "{{ groups['nfs_server'][0] }}"
+      become: yes
+
+  tasks:
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ NAMESPACE }}"
+
+    - name: Create NFS PV for stocks
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: stocks-pv
+          spec:
+            capacity:
+              storage: "{{ STOCKS_STORAGE }}"
+            accessModes: [ "ReadWriteMany" ]
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+            nfs:
+              server: "{{ NFS_SERVER_IP }}"
+              path: "{{ STOCKS_NFS_PATH }}"
+
+    - name: Create PVC for stocks
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: stocks-pvc
+            namespace: "{{ NAMESPACE }}"
+          spec:
+            accessModes: [ "ReadWriteMany" ]
+            resources:
+              requests:
+                storage: "{{ STOCKS_STORAGE }}"
+            storageClassName: ""
+            volumeName: stocks-pv
+
+    - name: Ensure a clean ServiceAccount without imagePullSecrets
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: public-pull
+            namespace: "{{ NAMESPACE }}"
+
+    - name: Delete old stocks Deployment (to reapply spec cleanly)
+      kubernetes.core.k8s:
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        name: stocks
+        namespace: "{{ NAMESPACE }}"
+      ignore_errors: yes
+
+    - name: Create/Update stocks Deployment
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: stocks
+            namespace: "{{ NAMESPACE }}"
+            labels: { app: stocks }
+          spec:
+            replicas: "{{ STOCKS_REPLICAS }}"
+            strategy:
+              type: Recreate
+            selector:
+              matchLabels:
+                app: stocks
+            template:
+              metadata:
+                labels:
+                  app: stocks
+              spec:
+                securityContext:
+                  runAsUser: "{{ stocks_dir_spec.owner | int }}"
+                  runAsGroup: "{{ stocks_dir_spec.group | int }}"
+                  fsGroup: "{{ stocks_dir_spec.group | int }}"
+                  fsGroupChangePolicy: "OnRootMismatch"
+                serviceAccountName: public-pull
+                restartPolicy: Always
+                containers:
+                  - name: stocks
+                    image: "python:3.12-slim"
+                    imagePullPolicy: IfNotPresent
+                    env:
+                      - name: HOME
+                        value: /app
+                      - name: INFLUX_URL
+                        value: "{{ INFLUXDB_URL }}"
+                      - name: INFLUX_TOKEN
+                        value: "{{ INFLUXDB_ADMIN_TOKEN }}"
+                      - name: INFLUX_ORG
+                        value: "{{ INFLUXDB_ORG }}"
+                      - name: INFLUX_BUCKET
+                        value: "{{ INFLUXDB_BUCKET }}"
+                      - name: TICKERS
+                        value: "{{ STOCKS_TICKERS }}"
+                      - name: STOCKS_POLL_SECONDS
+                        value: "{{ STOCKS_POLL_SECONDS }}"
+                      - name: YF_INTERVAL
+                        value: "{{ STOCKS_YF_INTERVAL }}"
+                      - name: YF_PERIOD
+                        value: "{{ STOCKS_YF_PERIOD }}"
+                    command: ["/bin/sh", "-lc"]
+                    args:
+                      - >
+                        if [ ! -d /app/.venv ]; then
+                          python -m venv /app/.venv;
+                        fi &&
+                        /app/.venv/bin/pip install --no-cache-dir -r /app/requirements.txt &&
+                        exec /app/.venv/bin/python -u /app/app.py
+                    resources:
+                      requests:
+                        cpu: "{{ STOCKS_CPU_REQUEST }}"
+                        memory: "{{ STOCKS_MEM_REQUEST }}"
+                      limits:
+                        cpu: "{{ STOCKS_CPU_LIMIT }}"
+                        memory: "{{ STOCKS_MEM_LIMIT }}"
+                    volumeMounts:
+                      - name: data
+                        mountPath: /app
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: stocks-pvc
+
+    - name: Verify /app directory permissions and contents in running stocks pod
+      ansible.builtin.shell: |
+        set -e
+        POD=$(kubectl -n {{ NAMESPACE }} get pod -l app=stocks -o jsonpath='{.items[0].metadata.name}')
+        echo "Checking pod: $POD"
+        kubectl -n {{ NAMESPACE }} exec "$POD" -- sh -lc 'id && ls -ld /app && ls -l /app || true'
+      register: stocks_ls_output
+      changed_when: false
+
+    - name: Print /app permissions from stocks pod
+      ansible.builtin.debug:
+        msg: "{{ stocks_ls_output.stdout_lines }}"
+

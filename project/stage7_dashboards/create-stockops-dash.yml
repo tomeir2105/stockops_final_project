@@ -1,0 +1,151 @@
+---
+# stage7_dashboards/create-stockops-dash.yml
+# Provision a Grafana Flux datasource and import dashboards idempotently.
+
+- name: Provision Grafana datasource & import dashboards
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    BASE_URL: "{{ GRAFANA_URL | regex_replace('/+$','') }}"
+    GRAFANA_DS_NAME: "influxdb-flux"
+    GRAFANA_DASHBOARDS_DIR: "{{ playbook_dir }}/../apps/grafana"
+    _headers:
+      Authorization: "Bearer {{ GRAFANA_TOKEN }}"
+      Content-Type: "application/json"
+
+  tasks:
+    - name: Look up existing datasource by name
+      uri:
+        url: "{{ BASE_URL }}/api/datasources/name/{{ GRAFANA_DS_NAME }}"
+        method: GET
+        headers: "{{ _headers }}"
+        return_content: true
+        status_code: [200,404]
+        validate_certs: false
+      register: ds_lookup
+
+    - name: Set datasource id when it exists
+      set_fact:
+        grafana_ds_id: "{{ ds_lookup.json.id }}"
+      when: ds_lookup.status == 200
+
+    - name: Clear datasource id when it does not exist
+      set_fact:
+        grafana_ds_id: null
+      when: ds_lookup.status != 200
+
+    - name: Define datasource payload
+      set_fact:
+        ds_payload: >-
+          {{
+            {
+              "name": GRAFANA_DS_NAME,
+              "type": "influxdb",
+              "access": "proxy",
+              "url": INFLUXDB_URL,
+              "basicAuth": false,
+              "jsonData": {
+                "version": "Flux",
+                "organization": INFLUXDB_ORG,
+                "defaultBucket": INFLUXDB_BUCKET,
+                "httpMode": "POST",
+                "tlsSkipVerify": true
+              },
+              "secureJsonData": {
+                "token": INFLUXDB_ADMIN_TOKEN
+              },
+              "isDefault": true
+            }
+          }}
+
+    - name: Create datasource if missing
+      uri:
+        url: "{{ BASE_URL }}/api/datasources"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ GRAFANA_TOKEN }}"
+          Content-Type: "application/json"
+          Connection: "close"
+        body: "{{ ds_payload }}"
+        body_format: json
+        return_content: true
+        status_code: [200,409]
+        validate_certs: false
+        follow_redirects: all
+        timeout: 30
+      when: grafana_ds_id is none
+      register: ds_create
+
+    - name: Update datasource if exists
+      uri:
+        url: "{{ BASE_URL }}/api/datasources/{{ grafana_ds_id }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ GRAFANA_TOKEN }}"
+          Content-Type: "application/json"
+          Connection: "close"
+        body: "{{ ds_payload }}"
+        body_format: json
+        return_content: true
+        status_code: [200]
+        validate_certs: false
+        follow_redirects: all
+        timeout: 30
+      when: grafana_ds_id is not none
+      register: ds_update
+
+    - name: Find all dashboard JSON files
+      find:
+        paths: "{{ GRAFANA_DASHBOARDS_DIR }}"
+        patterns: "*.json"
+        file_type: file
+        recurse: no
+      register: dash_files
+
+    - name: Fail if no dashboards found
+      fail:
+        msg: "No dashboard JSON files found in {{ GRAFANA_DASHBOARDS_DIR }}"
+      when: dash_files.matched | int == 0
+
+    # Use Grafana's import API and bind the dashboard input to your datasource
+    - name: Import dashboards (via /api/dashboards/import)
+      vars:
+        dash_json: "{{ lookup('file', item.path) | from_json }}"
+        payload:
+          dashboard: "{{ dash_json | combine({'id': None}, recursive=True) }}"
+          overwrite: true
+          inputs:
+            - name: "DS_INFLUXDB"
+              type: "datasource"
+              pluginId: "influxdb"
+              value: "{{ GRAFANA_DS_NAME }}"
+      uri:
+        url: "{{ BASE_URL }}/api/dashboards/import"
+        method: POST
+        headers: "{{ _headers }}"
+        body: "{{ payload }}"
+        body_format: json
+        return_content: true
+        status_code: [200]
+        validate_certs: false
+        timeout: 30
+      loop: "{{ dash_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: import_results
+      throttle: 1
+
+    - name: Summary (count)
+      debug:
+        msg: "Imported/updated {{ import_results.results | length }} dashboards"
+
+    - name: Imported dashboards (list)
+      debug:
+        msg: "{{ item.item.path | regex_replace('.*/','') }}"
+      loop: "{{ import_results.results }}"
+

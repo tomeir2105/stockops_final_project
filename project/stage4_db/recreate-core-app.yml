@@ -1,0 +1,182 @@
+---
+# recreate-core-app.yml
+# Recreate Grafana OR InfluxDB from zero using ONLY vars from vars.yml where possible.
+# Steps: delete k8s objects → wipe NFS dir (preserve parent) → recreate PV/PVC → run stage4_db/deploy-03-stockops.yml
+# ansible-playbook -i ~/stockops/project/inventory.ini recreate-core-app.yml -e target_app=influxdb
+# ansible-playbook -i ~/stockops/project/inventory.ini recreate-core-app.yml -e target_app=grafana
+
+- name: Resolve app configuration from vars.yml
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    ns: "{{ NAMESPACE }}"
+    nfs_server_ip: "{{ NFS_SERVER_IP }}"
+    # Access modes are not in vars.yml; set sane defaults per app:
+    access_modes_map:
+      grafana: ["ReadWriteMany"]
+      influxdb: ["ReadWriteOnce"]
+  tasks:
+    - name: Validate target_app
+      assert:
+        that:
+          - target_app is defined
+          - target_app in ['grafana','influxdb']
+        fail_msg: "Provide -e target_app=grafana|influxdb"
+
+    # pull PVC/PV names for the chosen app from APP_PVCS
+    - name: Pick PVC/PV names from APP_PVCS
+      set_fact:
+        _pvc_item: "{{ (APP_PVCS | selectattr('name','equalto', target_app ~ '-pvc') | list | first) }}"
+      failed_when: _pvc_item is not defined
+
+    - name: Derive NFS dir entry from APP_DIRS
+      set_fact:
+        _dir_item: "{{ (APP_DIRS | selectattr('path','search','/' ~ target_app ~ '$') | list | first) }}"
+      failed_when: _dir_item is not defined
+
+    - name: Compose app facts
+      set_fact:
+        app_ns: "{{ ns }}"
+        app_name: "{{ target_app }}"
+        deploy_name: "{{ target_app }}"
+        svc_name: "{{ target_app }}"
+        pvc_name: "{{ _pvc_item.name }}"
+        pv_name: "{{ _pvc_item.pv }}"
+        nfs_path: "{{ _dir_item.path }}"
+        nfs_owner: "{{ _dir_item.owner }}"
+        nfs_group: "{{ _dir_item.group }}"
+        nfs_mode:  "{{ _dir_item.mode }}"
+        access_modes: "{{ access_modes_map[target_app] }}"
+        storage_size: >-
+          {{ GRAFANA_STORAGE if target_app=='grafana' else INFLUXDB_STORAGE }}
+
+    - name: Show plan
+      debug:
+        msg:
+          - "App: {{ app_name }}  NS: {{ app_ns }}"
+          - "PVC/PV: {{ pvc_name }} / {{ pv_name }}"
+          - "NFS: {{ nfs_server_ip }}:{{ nfs_path }}  owner:{{nfs_owner}} group:{{nfs_group}} mode:{{nfs_mode}}"
+          - "Size: {{ storage_size }}  AccessModes: {{ access_modes | join(',') }}"
+
+# ── Delete k8s objects ───────────────────────────────────────────────────────
+- name: Delete k8s objects for the app
+  hosts: k3s_server
+  become: true
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG }}"
+  tasks:
+    - name: Delete Deployment (ignore if missing)
+      shell: kubectl -n {{ hostvars['localhost'].app_ns }} delete deploy {{ hostvars['localhost'].deploy_name }} --wait=false 2>/dev/null || true
+      args: { executable: /bin/bash }
+
+    - name: Delete Service (ignore if missing)
+      shell: kubectl -n {{ hostvars['localhost'].app_ns }} delete svc {{ hostvars['localhost'].svc_name }} --wait=false 2>/dev/null || true
+      args: { executable: /bin/bash }
+
+    - name: Delete PVC (ignore if missing)
+      shell: kubectl -n {{ hostvars['localhost'].app_ns }} delete pvc {{ hostvars['localhost'].pvc_name }} --wait=false 2>/dev/null || true
+      args: { executable: /bin/bash }
+
+    - name: Delete PV (ignore if missing)
+      shell: kubectl delete pv {{ hostvars['localhost'].pv_name }} --wait=false 2>/dev/null || true
+      args: { executable: /bin/bash }
+
+# ── Wipe NFS directory (use APP_DIRS owners/permissions) ─────────────────────
+- name: Wipe NFS directory contents safely
+  hosts: k3srouter_host
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Ensure base directory exists with desired ownership/permissions from vars.yml
+      file:
+        path: "{{ hostvars['localhost'].nfs_path }}"
+        state: directory
+        owner: "{{ hostvars['localhost'].nfs_owner }}"
+        group: "{{ hostvars['localhost'].nfs_group }}"
+        mode: "{{ hostvars['localhost'].nfs_mode }}"
+
+    - name: List immediate children
+      find:
+        paths: "{{ hostvars['localhost'].nfs_path }}"
+        file_type: any
+        depth: 1
+      register: _nfs_children
+
+    - name: Remove everything inside (preserve parent)
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _nfs_children.files }}"
+      when: item.path != hostvars['localhost'].nfs_path
+
+# ── Recreate PV & PVC from vars ──────────────────────────────────────────────
+- name: Recreate PV and PVC
+  hosts: k3s_server
+  become: true
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG }}"
+  tasks:
+    - name: Create static NFS PersistentVolume
+      shell: |
+        cat <<'YAML' | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: {{ hostvars['localhost'].pv_name }}
+        spec:
+          capacity:
+            storage: {{ hostvars['localhost'].storage_size }}
+          accessModes: {{ hostvars['localhost'].access_modes | to_nice_json }}
+          persistentVolumeReclaimPolicy: Retain
+          nfs:
+            server: {{ hostvars['localhost'].nfs_server_ip }}
+            path: {{ hostvars['localhost'].nfs_path }}
+        YAML
+      args: { executable: /bin/bash }
+
+    - name: Create PersistentVolumeClaim bound to PV
+      shell: |
+        cat <<'YAML' | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: {{ hostvars['localhost'].pvc_name }}
+          namespace: {{ hostvars['localhost'].app_ns }}
+        spec:
+          accessModes: {{ hostvars['localhost'].access_modes | to_nice_json }}
+          resources:
+            requests:
+              storage: {{ hostvars['localhost'].storage_size }}
+          volumeName: {{ hostvars['localhost'].pv_name }}
+        YAML
+      args: { executable: /bin/bash }
+
+    - name: Wait until PVC is Bound
+      shell: |
+        for i in {1..30}; do
+          phase="$(kubectl -n {{ hostvars['localhost'].app_ns }} get pvc {{ hostvars['localhost'].pvc_name }} -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+          [ "$phase" = "Bound" ] && exit 0
+          sleep 2
+        done
+        echo "PVC not Bound in time"; exit 1
+      args: { executable: /bin/bash }
+
+# ── Hand off to your stage4 deployment ───────────────────────────────────────
+- name: Redeploy the app via stage4_db/deploy-03-stockops.yml
+  hosts: k3srouter_host
+  gather_facts: false
+  tasks:
+    - name: Run stage4_db deploy
+      command: >
+        ansible-playbook
+        -i {{ playbook_dir }}/inventory.ini
+        {{ playbook_dir }}/stage4_db/deploy-03-stockops.yml
+

@@ -1,0 +1,112 @@
+---
+# Install k3s AGENTS only
+- name: Install k3s agents
+  hosts: k3s_workers
+  become: yes
+  vars:
+    # derive server IP from the first host in k3s_server
+    k3s_server_ip: "{{ hostvars[groups['k3s_server'][0]].ansible_host | default(groups['k3s_server'][0]) }}"
+    k3s_server_host: "{{ groups['k3s_server'][0] }}"
+    k3s_async_timeout: 1800
+    k3s_poll_interval: 10
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+  pre_tasks:
+    - import_tasks: k3s-99-utils.yml
+
+    - name: Verify server token exists
+      stat:
+        path: /var/lib/rancher/k3s/server/node-token
+      delegate_to: "{{ k3s_server_host }}"
+      become: yes
+      register: tokenstat
+      run_once: true
+
+    - name: Fail with hint if server not installed yet
+      fail:
+        msg: >
+          Node token not found on {{ k3s_server_host }}.
+          Install k3s server first, then re-run.
+          Expected: /var/lib/rancher/k3s/server/node-token
+      when: not tokenstat.stat.exists
+      run_once: true
+
+    - name: Read server node-token (once)
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      delegate_to: "{{ k3s_server_host }}"
+      become: yes
+      register: node_token_raw
+      run_once: true
+
+    - name: Decode join token (controller-side fact)
+      set_fact:
+        k3s_join_token: "{{ node_token_raw.content | b64decode | trim }}"
+      run_once: true
+
+  tasks:
+    - name: Ensure config dir
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: Write join token file on worker
+      copy:
+        dest: /etc/rancher/k3s/node-token
+        mode: "0600"
+        content: "{{ k3s_join_token }}"
+
+    - name: Write /etc/rancher/k3s/config.yaml (no token here)
+      copy:
+        dest: /etc/rancher/k3s/config.yaml
+        mode: "0644"
+        content: |
+          server: https://{{ k3s_server_ip }}:6443
+          node-name: "{{ inventory_hostname | lower }}"
+
+    - name: Check HTTPS connectivity to get.k3s.io (agent, with retries)
+      command: curl -sS --head https://get.k3s.io
+      register: https_check
+      changed_when: false
+      retries: 5
+      delay: 5
+      until: https_check.rc == 0
+
+    - name: Run k3s agent installer (async)
+      shell: |
+        set -e
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_TYPE=agent \
+          K3S_URL=https://{{ k3s_server_ip }}:6443 \
+          K3S_TOKEN_FILE=/etc/rancher/k3s/node-token \
+          sh -
+      args:
+        executable: /bin/bash
+      async: "{{ k3s_async_timeout }}"
+      poll: "{{ k3s_poll_interval }}"
+      register: k3s_install
+
+    - name: Confirm k3s-agent unit file exists
+      stat:
+        path: /etc/systemd/system/k3s-agent.service
+      register: agent_unit_stat
+
+    - name: Fail if k3s-agent unit missing (show installer output)
+      fail:
+        msg: |
+          k3s agent did not install a systemd unit.
+          --- installer stdout ---
+          {{ k3s_install.stdout | default('') }}
+          --- installer stderr ---
+          {{ k3s_install.stderr | default('') }}
+      when: not agent_unit_stat.stat.exists
+
+    - name: Start and enable k3s-agent
+      systemd:
+        name: k3s-agent
+        state: started
+        enabled: yes
+        daemon_reload: yes
+

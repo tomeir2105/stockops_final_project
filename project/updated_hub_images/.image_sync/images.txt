@@ -1,0 +1,8 @@
+docker.io/meir25/jenkins:lts-jdk17
+grafana/grafana:10.4.0
+influxdb:2.7
+rancher/klipper-lb:v0.4.13
+rancher/local-path-provisioner:v0.0.31
+rancher/mirrored-coredns-coredns:1.12.3
+rancher/mirrored-library-traefik:3.3.6
+rancher/mirrored-metrics-server:v0.8.0

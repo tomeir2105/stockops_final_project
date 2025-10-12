@@ -1,0 +1,254 @@
+---
+# deploy-jenkins.yml — uses APP_DIRS only (no asserts, no defaults)
+
+#############################
+# Play 1: Prepare NFS dir
+#############################
+- name: Prepare NFS for Jenkins
+  hosts: k3srouter
+  become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    # Pick the APP_DIRS row for Jenkins
+    jenkins_dir: "{{ (APP_DIRS | selectattr('path','search','/jenkins$') | list | first) }}"
+
+  tasks:
+    - name: Ensure Jenkins data dir exists (from APP_DIRS entry)
+      ansible.builtin.file:
+        path: "{{ jenkins_dir.path }}"
+        state: directory
+        owner: "{{ jenkins_dir.owner }}"
+        group: "{{ jenkins_dir.group }}"
+        mode: "{{ jenkins_dir.mode }}"
+        recurse: yes
+    - name: Ensure Jenkins NFS directory has correct owner/group/mode (from vars.yml)
+      ansible.builtin.file:
+        path: "{{ jenkins_dir.path }}"
+        state: directory
+        owner: "{{ jenkins_dir.owner | int }}"
+        group: "{{ jenkins_dir.group | int }}"
+        mode: "{{ jenkins_dir.mode }}"
+        recurse: yes
+
+###############################################
+# Play 2: Deploy Jenkins on k3s using NFS PV
+###############################################
+- name: Deploy Jenkins on k3s using NFS-backed PV
+  hosts: k3s_server
+  become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    workdir: "/tmp/jenkins"
+    jenkins_sa: "jenkins-sa"
+    # re-derive here for this play's scope
+    jenkins_dir: "{{ (APP_DIRS | selectattr('path','search','/jenkins$') | list | first) }}"
+
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG }}"
+
+  tasks:
+    - name: Create work directory
+      ansible.builtin.file:
+        path: "{{ workdir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure namespace exists
+      ansible.builtin.shell: |
+        kubectl get ns {{ NAMESPACE }} >/dev/null 2>&1 || kubectl create ns {{ NAMESPACE }}
+      args:
+        executable: /bin/bash
+
+    - name: Render Jenkins manifests
+      ansible.builtin.copy:
+        dest: "{{ workdir }}/jenkins.yaml"
+        mode: "0644"
+        content: |
+          ---
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{ NAMESPACE }}
+
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: {{ jenkins_sa }}
+            namespace: {{ NAMESPACE }}
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: jenkins-read-secrets
+            namespace: {{ NAMESPACE }}
+          rules:
+            - apiGroups: [""]
+              resources: ["secrets"]
+              verbs: ["get","list","watch"]
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: jenkins-read-secrets
+            namespace: {{ NAMESPACE }}
+          subjects:
+            - kind: ServiceAccount
+              name: {{ jenkins_sa }}
+              namespace: {{ NAMESPACE }}
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: jenkins-read-secrets
+
+          ---
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: jenkins-pv
+          spec:
+            capacity:
+              storage: {{ JENKINS_STORAGE }}
+            accessModes: ["ReadWriteMany"]
+            persistentVolumeReclaimPolicy: Retain
+            nfs:
+              server: {{ NFS_SERVER_IP }}
+              path: "{{ NFS_MOUNTPOINT }}/jenkins"
+
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: jenkins-pvc
+            namespace: {{ NAMESPACE }}
+          spec:
+            accessModes: ["ReadWriteMany"]
+            resources:
+              requests:
+                storage: {{ JENKINS_STORAGE }}
+            volumeName: jenkins-pv
+            storageClassName: ""
+
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: jenkins
+            namespace: {{ NAMESPACE }}
+            labels:
+              app: jenkins
+          spec:
+            strategy:
+              type: Recreate
+            replicas: {{ JENKINS_REPLICAS }}
+            selector:
+              matchLabels:
+                app: jenkins
+            template:
+              metadata:
+                labels:
+                  app: jenkins
+              spec:
+                serviceAccountName: {{ jenkins_sa }}
+                securityContext:
+                  # Use numeric group from APP_DIRS as fsGroup
+                  fsGroup: {{ jenkins_dir.group | int }}
+                containers:
+                  - name: jenkins
+                    image: "{{ JENKINS_IMAGE_REPO }}:{{ JENKINS_TAG }}"
+                    ports:
+                      - containerPort: {{ JENKINS_API_PORT }}
+                    securityContext:
+                      runAsUser: {{ jenkins_dir.owner | int }}
+                      runAsGroup: {{ jenkins_dir.group | int }}
+                    env:
+                      - name: JAVA_OPTS
+                        value: "-Djenkins.install.runSetupWizard=false"
+                    resources:
+                      requests:
+                        cpu: "{{ JENKINS_CPU_REQUEST }}"
+                        memory: "{{ JENKINS_MEM_REQUEST }}"
+                      limits:
+                        cpu: "{{ JENKINS_CPU_LIMIT }}"
+                        memory: "{{ JENKINS_MEM_LIMIT }}"
+                    volumeMounts:
+                      - name: jenkins-home
+                        mountPath: /var/jenkins_home
+                    readinessProbe:
+                      httpGet:
+                        path: /login
+                        port: {{ JENKINS_API_PORT }}
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                volumes:
+                  - name: jenkins-home
+                    persistentVolumeClaim:
+                      claimName: jenkins-pvc
+
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: jenkins
+            namespace: {{ NAMESPACE }}
+          spec:
+            selector:
+              app: jenkins
+            type: NodePort
+            ports:
+              - name: http
+                port: {{ JENKINS_API_PORT }}
+                targetPort: {{ JENKINS_API_PORT }}
+                nodePort: {{ JENKINS_NODEPORT }}
+
+    - name: Apply Jenkins manifests
+      ansible.builtin.shell: kubectl apply -f {{ workdir }}/jenkins.yaml
+      args:
+        executable: /bin/bash
+
+    - name: Wait for Jenkins rollout
+      ansible.builtin.shell: kubectl -n {{ NAMESPACE }} rollout status deploy/jenkins --timeout=10m
+      args:
+        executable: /bin/bash
+
+    - name: Set Jenkins admin password from vars.yml
+      ansible.builtin.shell: |
+        POD=$(kubectl -n {{ NAMESPACE }} get pod -l app=jenkins -o jsonpath='{.items[0].metadata.name}')
+        kubectl -n {{ NAMESPACE }} exec -i "$POD" -- bash -lc "
+          cat > /tmp/set-pass.groovy <<'GROOVY'
+          import jenkins.model.*
+          import hudson.security.*
+
+          def instance = Jenkins.get()
+          def user = hudson.model.User.get('{{ JENKINS_ADMIN_USER }}', false)
+          if (user != null) {
+              def password = '{{ JENKINS_ADMIN_PASS }}'
+              user.addProperty(new hudson.security.HudsonPrivateSecurityRealm.Details(password))
+              user.save()
+              println '✅ Updated Jenkins password for {{ JENKINS_ADMIN_USER }}'
+          } else {
+              println '⚠️  Jenkins user {{ JENKINS_ADMIN_USER }} not found'
+          }
+          GROOVY
+          java -jar /usr/share/jenkins/jenkins.war groovy /tmp/set-pass.groovy
+        "
+      args:
+        executable: /bin/bash
+
+    - name: Show Jenkins service
+      ansible.builtin.shell: kubectl -n {{ NAMESPACE }} get svc jenkins -o wide
+      args:
+        executable: /bin/bash
+      register: svc_out
+
+    - ansible.builtin.debug:
+        msg:
+          - "Jenkins → {{ JENKINS_URL }}"
+          - "{{ svc_out.stdout }}"
+
+

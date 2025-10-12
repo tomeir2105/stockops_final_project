@@ -1,0 +1,110 @@
+---
+# Creates/updates a Flux datasource (set as DEFAULT) and imports ONE dashboard JSON idempotently.
+
+- name: Provision Grafana datasource & import monitor dashboard
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"   # needs: GRAFANA_URL, GRAFANA_TOKEN, INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_ADMIN_TOKEN
+
+  vars:
+    BASE_URL: "{{ GRAFANA_URL | regex_replace('/+$','') }}"
+    GRAFANA_DS_NAME: "influxdb-flux"
+    MONITOR_DASHBOARD_FILE: "{{ playbook_dir }}/../apps/grafana/monitor-dashboard.json"
+    _headers:
+      Authorization: "Bearer {{ GRAFANA_TOKEN }}"
+      Content-Type: "application/json"
+
+  tasks:
+    - name: Normalize base URL
+      set_fact:
+        BASE_URL: "{{ GRAFANA_URL | regex_replace('/+$','') }}"
+
+    - name: Look up datasource by name
+      uri:
+        url: "{{ BASE_URL }}/api/datasources/name/{{ GRAFANA_DS_NAME }}"
+        method: GET
+        headers: "{{ _headers }}"
+        return_content: true
+        status_code: [200, 404]
+        validate_certs: false
+      register: ds_lookup
+
+    - name: Define datasource payload (Flux, DEFAULT)
+      set_fact:
+        ds_payload:
+          name: "{{ GRAFANA_DS_NAME }}"
+          type: influxdb
+          access: proxy
+          url: "{{ INFLUXDB_URL }}"
+          basicAuth: false
+          jsonData:
+            version: "Flux"
+            organization: "{{ INFLUXDB_ORG }}"
+            defaultBucket: "{{ INFLUXDB_BUCKET }}"
+            httpMode: "POST"
+            tlsSkipVerify: true
+          secureJsonData:
+            token: "{{ INFLUXDB_ADMIN_TOKEN }}"
+          isDefault: true
+
+    - name: Create datasource if missing
+      uri:
+        url: "{{ BASE_URL }}/api/datasources"
+        method: POST
+        headers: "{{ _headers }}"
+        body: "{{ ds_payload }}"
+        body_format: json
+        return_content: true
+        status_code: [200, 409]
+        validate_certs: false
+      when: ds_lookup.status == 404
+      register: ds_create
+
+    - name: Update datasource if it exists (also sets as default)
+      uri:
+        url: "{{ BASE_URL }}/api/datasources/{{ ds_lookup.json.id }}"
+        method: PUT
+        headers: "{{ _headers }}"
+        body: "{{ ds_payload }}"
+        body_format: json
+        return_content: true
+        status_code: [200]
+        validate_certs: false
+      when: ds_lookup.status == 200
+      register: ds_update
+
+    - name: Ensure monitor dashboard JSON exists
+      stat:
+        path: "{{ MONITOR_DASHBOARD_FILE }}"
+      register: dash_stat
+
+    - name: Fail if dashboard file missing
+      fail:
+        msg: "Dashboard file not found: {{ MONITOR_DASHBOARD_FILE }}"
+      when: not dash_stat.stat.exists
+
+    - name: Load dashboard file and null the id (idempotent import)
+      set_fact:
+        monitor_dash_json: "{{ (lookup('file', MONITOR_DASHBOARD_FILE) | from_json) | combine({'id': None, 'refresh': '1m'}, recursive=True) }}"
+
+    - name: Import/overwrite monitor dashboard
+      uri:
+        url: "{{ BASE_URL }}/api/dashboards/db"
+        method: POST
+        headers: "{{ _headers }}"
+        body:
+          dashboard: "{{ monitor_dash_json }}"
+          overwrite: true
+        body_format: json
+        return_content: true
+        status_code: [200]
+        validate_certs: false
+      register: import_result
+
+    - name: Summary
+      debug:
+        msg: "Monitor dashboard imported/updated. Default datasource set to '{{ GRAFANA_DS_NAME }}'."
+

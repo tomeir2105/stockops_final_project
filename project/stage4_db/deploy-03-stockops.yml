@@ -1,0 +1,257 @@
+---
+# deploy-03-observability-deploy.yml — Deploy Grafana & InfluxDB on k3s with NFS storage
+
+- name: Deploy observability stack
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    ns: "{{ NAMESPACE }}"
+    nfs_server_ip: "{{ NFS_SERVER_IP }}"
+    influx_pv_path: "{{ NFS_MOUNTPOINT }}/influxdb"
+    grafana_pv_path: "{{ NFS_MOUNTPOINT }}/grafana"
+
+  tasks:
+    - name: Ensure namespace exists (idempotent)
+      ansible.builtin.shell: |
+        kubectl create ns {{ ns }} --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+      register: ns_result
+      changed_when: "'created' in (ns_result.stdout | default('')) or 'configured' in (ns_result.stdout | default(''))"
+
+    # -------------------------
+    # InfluxDB storage objects
+    # -------------------------
+    - name: Create PersistentVolume for InfluxDB
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: influxdb-pv
+        spec:
+          capacity:
+            storage: {{ INFLUXDB_STORAGE }}
+          accessModes:
+            - ReadWriteOnce
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: manual
+          nfs:
+            server: {{ nfs_server_ip }}
+            path: {{ influx_pv_path }}
+        EOF
+      args:
+        executable: /bin/bash
+
+    - name: Create PersistentVolumeClaim for InfluxDB
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: influxdb-pvc
+          namespace: {{ ns }}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: manual
+          resources:
+            requests:
+              storage: {{ INFLUXDB_STORAGE }}
+          volumeName: influxdb-pv
+        EOF
+      args:
+        executable: /bin/bash
+
+    # -------------------------
+    # Grafana storage objects
+    # -------------------------
+    - name: Create PersistentVolume for Grafana
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: grafana-pv
+        spec:
+          capacity:
+            storage: {{ GRAFANA_STORAGE }}
+          accessModes:
+            - ReadWriteOnce
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: manual
+          nfs:
+            server: {{ nfs_server_ip }}
+            path: {{ grafana_pv_path }}
+        EOF
+      args:
+        executable: /bin/bash
+
+    - name: Create PersistentVolumeClaim for Grafana
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: grafana-pvc
+          namespace: {{ ns }}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: manual
+          resources:
+            requests:
+              storage: {{ GRAFANA_STORAGE }}
+          volumeName: grafana-pv
+        EOF
+      args:
+        executable: /bin/bash
+
+    # -------------------------
+    # InfluxDB workload + svc
+    # -------------------------
+    - name: Deploy InfluxDB
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} apply -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: influxdb
+          labels:
+            app: influxdb
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: influxdb
+          template:
+            metadata:
+              labels:
+                app: influxdb
+            spec:
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                fsGroup: 1000
+                fsGroupChangePolicy: "OnRootMismatch"
+              containers:
+                - name: influxdb
+                  image: influxdb:2.7
+                  ports:
+                    - containerPort: 8086
+                  volumeMounts:
+                    - name: influx-storage
+                      mountPath: /var/lib/influxdb2
+                  env:
+                    - name: DOCKER_INFLUXDB_INIT_MODE
+                      value: setup
+                    - name: DOCKER_INFLUXDB_INIT_USERNAME
+                      value: "{{ INFLUXDB_ADMIN_USER }}"
+                    - name: DOCKER_INFLUXDB_INIT_PASSWORD
+                      value: "{{ INFLUXDB_ADMIN_PASSWORD }}"
+                    - name: DOCKER_INFLUXDB_INIT_ORG
+                      value: "{{ INFLUXDB_ORG }}"
+                    - name: DOCKER_INFLUXDB_INIT_BUCKET
+                      value: "{{ INFLUXDB_BUCKET }}"
+                    - name: DOCKER_INFLUXDB_INIT_ADMIN_TOKEN
+                      value: "{{ INFLUXDB_ADMIN_TOKEN }}"
+              volumes:
+                - name: influx-storage
+                  persistentVolumeClaim:
+                    claimName: influxdb-pvc
+        EOF
+      args:
+        executable: /bin/bash
+
+    - name: Create InfluxDB NodePort service
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: influxdb
+        spec:
+          selector:
+            app: influxdb
+          ports:
+            - name: http
+              port: 8086
+              targetPort: 8086
+              nodePort: {{ INFLUX_NODEPORT }}
+          type: NodePort
+        EOF
+      args:
+        executable: /bin/bash
+
+    # -------------------------
+    # Grafana workload + svc
+    # -------------------------
+    - name: Deploy Grafana with PVC
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} apply -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: grafana
+          labels:
+            app: grafana
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: grafana
+          template:
+            metadata:
+              labels:
+                app: grafana
+            spec:
+              securityContext:
+                runAsUser: 472
+                runAsGroup: 472
+                fsGroup: 472
+                fsGroupChangePolicy: "OnRootMismatch"
+              containers:
+                - name: grafana
+                  image: grafana/grafana:10.4.0
+                  ports:
+                    - containerPort: 3000
+                  volumeMounts:
+                    - name: grafana-storage
+                      mountPath: /var/lib/grafana
+                  env:
+                    - name: GF_SECURITY_ADMIN_USER
+                      value: "{{ GRAFANA_ADMIN_USER }}"
+                    - name: GF_SECURITY_ADMIN_PASSWORD
+                      value: "{{ GRAFANA_ADMIN_PASSWORD }}"
+              volumes:
+                - name: grafana-storage
+                  persistentVolumeClaim:
+                    claimName: grafana-pvc
+        EOF
+      args:
+        executable: /bin/bash
+
+    - name: Create Grafana NodePort service
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: grafana
+        spec:
+          selector:
+            app: grafana
+          ports:
+            - name: http
+              port: 3000
+              targetPort: 3000
+              nodePort: {{ GRAFANA_NODEPORT }}
+          type: NodePort
+        EOF
+      args:
+        executable: /bin/bash
+

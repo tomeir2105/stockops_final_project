@@ -1,0 +1,88 @@
+// No stored cron on the job itself
+properties([ pipelineTriggers([]) ])
+
+pipeline {
+  agent any
+
+  environment {
+    INFLUX_URL    = 'http://192.168.50.101:30886'
+    INFLUX_ORG    = 'monitor'
+    INFLUX_BUCKET = 'netdata_2h'
+  }
+
+  options {
+    timeout(time: 3, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '50'))
+  }
+
+  triggers {
+    cron('H/3 * * * *')   // every ~3 minutes
+  }
+
+  stages {
+    stage('Fetch & Push (single call per RPi)') {
+      matrix {
+        axes {
+          axis {
+            name 'TARGET'
+            values(
+              'rpi1@http://192.168.50.101:19999',
+              'rpi2@http://192.168.50.102:19999',
+              'rpi3@http://192.168.50.103:19999'
+            )
+          }
+        }
+
+        stages {
+          stage('Pull → Parse → Push') {
+            steps {
+              withCredentials([string(credentialsId: 'influxdb_token', variable: 'INFLUX_TOKEN')]) {
+                sh '''
+                  set -e
+
+                  HOST_TAG="${TARGET%@*}"
+                  NETDATA_URL="${TARGET#*@}"
+                  BRDIR=".work_${HOST_TAG}"
+                  mkdir -p "$BRDIR"
+                  LP="$BRDIR/lp.txt"
+
+                  curl -sS "${NETDATA_URL}/api/v1/allmetrics?format=prometheus&help=no&types=no&timestamps=yes&names=yes&labels=yes" \
+                  | awk -v host="$HOST_TAG" '
+                    function isnum(x){ return x ~ /^-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$/ }
+                    /^#/ { next }
+                    {
+                      n=NF
+                      if (n>=2 && isnum($(n-1)) && isnum($n)) { val=$(n-1); ts_ms=$n }
+                      if (index($0, "chart=\\"system.load\\"") && index($0, "dimension=\\"load1\\""))                       load1=val
+                      else if (index($0, "chart=\\"system.ram\\"") && index($0, "dimension=\\"used\\""))                  used=val
+                      else if (index($0, "chart=\\"system.cpu\\"") && match($0, /dimension=\\"(user|system|nice|iowait|irq|softirq|steal|guest|guest_nice)\\"/)) cpu+=val
+                      else if (index($0,"sensors") && index($0,"temperature") && index($0,"_alarm")==0 && temp=="")      temp=val
+                    }
+                    END{
+                      ts_s = (ts_ms=="") ? systime() : int(ts_ms/1000)
+                      if (cpu!="")  printf "netdata_cpu,host=%s used_percent=%s %d\\n", host, cpu,  ts_s
+                      if (load1!="")printf "netdata_load,host=%s load1=%s %d\\n",        host, load1,ts_s
+                      if (used!="") printf "netdata_mem,host=%s used_bytes=%s %d\\n",    host, used, ts_s
+                      if (temp!="") printf "netdata_temp,host=%s celsius=%s %d\\n",      host, temp, ts_s
+                    }' > "$LP"
+
+                  # Skip if nothing parsed
+                  [ ! -s "$LP" ] && exit 0
+
+                  curl -sS -o /dev/null -w "%{http_code}" \
+                    -H "Authorization: Token $INFLUX_TOKEN" \
+                    -H "Content-Type: text/plain; charset=utf-8" \
+                    --data-binary @"$LP" \
+                    "$INFLUX_URL/api/v2/write?org=$INFLUX_ORG&bucket=$INFLUX_BUCKET&precision=s" \
+                    | grep -qx 204
+                '''
+              }
+            }
+          }
+        } // stages
+      } // matrix
+    } // stage
+  } // stages
+}
+

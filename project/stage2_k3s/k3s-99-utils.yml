@@ -1,0 +1,54 @@
+---
+# INTERNAL TASKS FILE – DO NOT RUN DIRECTLY.
+# Helper for Debian/Ubuntu hosts only.
+
+- name: Ensure apt uses IPv4 (prevents hang on some networks)
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/99force-ipv4
+    content: |
+      Acquire::ForceIPv4 "true";
+    owner: root
+    group: root
+    mode: "0644"
+  become: yes
+  when: ansible_os_family == 'Debian'
+  tags: ['bootstrap']
+
+- name: Recover from any interrupted dpkg
+  ansible.builtin.command: dpkg --configure -a
+  changed_when: false
+  become: yes
+  when: ansible_os_family == 'Debian'
+  tags: ['bootstrap']
+
+- name: Update apt cache (wait for locks, retry)
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+    force_apt_get: yes
+    lock_timeout: 600
+  register: apt_update_common
+  retries: 5
+  delay: 10
+  until: apt_update_common is succeeded
+  become: yes
+  when: ansible_os_family == 'Debian'
+  tags: ['bootstrap']
+
+- name: Install prerequisites (curl, CA certs)
+  ansible.builtin.apt:
+    name:
+      - curl
+      - ca-certificates
+    state: present
+    force_apt_get: yes
+    update_cache: no
+    lock_timeout: 600
+  register: apt_pkgs_common
+  retries: 5
+  delay: 10
+  until: apt_pkgs_common is succeeded
+  become: yes
+  when: ansible_os_family == 'Debian'
+  tags: ['bootstrap']
+

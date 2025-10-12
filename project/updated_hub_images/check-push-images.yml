@@ -1,0 +1,346 @@
+---
+###############################################################################
+# Stage 0 — Preflight: ensure tools installed + load/verify vars (ALL installs)
+###############################################################################
+- name: Stage 0 — Preflight
+  hosts: k3srouter_host:k3s_server
+  gather_facts: yes
+  become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/dockerhub.yml"
+
+  tasks:
+    # Keep cache fresh on Debian/Ubuntu hosts
+    - name: Update apt cache if needed
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_facts.pkg_mgr == 'apt'
+
+    # Install skopeo ONLY on the router (where we run Hub ops)
+    - name: Ensure skopeo is installed on router
+      ansible.builtin.package:
+        name: skopeo
+        state: present
+      when: "'k3srouter_host' in group_names"
+
+    # Install jq on ALL target hosts (router + servers)
+    - name: Ensure jq is installed
+      ansible.builtin.package:
+        name: jq
+        state: present
+
+    # Load/validate vars (run once to avoid duplicate prints)
+    - name: Show loaded values (password masked)
+      ansible.builtin.debug:
+        msg:
+          - "dockerhub_registry: {{ dockerhub_registry | default('UNDEFINED') }}"
+          - "dockerhub_username: {{ dockerhub_username | default('UNDEFINED') }}"
+          - "dockerhub_password: **** (masked)"
+          - "kubeconfig: {{ kubeconfig | default('UNDEFINED') }}"
+      run_once: true
+
+    - name: Assert required vars are present and non-empty
+      ansible.builtin.assert:
+        that:
+          - dockerhub_registry is defined
+          - (dockerhub_registry | string) | length > 0
+          - dockerhub_username is defined
+          - (dockerhub_username | string) | length > 0
+          - dockerhub_password is defined
+          - (dockerhub_password | string) | length > 0
+          - kubeconfig is defined
+          - (kubeconfig | string) | length > 0
+        fail_msg: >
+          Missing required variables. Ensure ../group_vars/dockerhub.yml defines:
+          dockerhub_registry, dockerhub_username, dockerhub_password, kubeconfig
+      run_once: true
+
+###############################################################################
+# Stage 2 — Docker Hub connectivity and credentials (daemonless via skopeo)
+###############################################################################
+- name: Stage 2 — Docker Hub connectivity
+  hosts: k3srouter_host
+  gather_facts: no
+  become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/dockerhub.yml"
+
+  tasks:
+    - name: Probe registry (expect 200 OK or 401 Auth challenge)
+      ansible.builtin.uri:
+        url: "https://registry-1.docker.io/v2/"
+        method: HEAD
+        status_code: [200, 401]
+        return_content: no
+      register: hub_probe
+      changed_when: false
+
+    - name: Show probe result
+      ansible.builtin.debug:
+        msg:
+          - "Reachable: {{ hub_probe.status in [200, 401] }}"
+          - "HTTP: {{ hub_probe.status }}"
+          - "Auth header: {{ hub_probe.www_authenticate | default('n/a') }}"
+
+    - name: Login to Docker Hub with skopeo (token)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        skopeo login docker.io -u "{{ dockerhub_username }}" -p "{{ dockerhub_password }}" 1>/dev/null
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Confirm login
+      ansible.builtin.debug:
+        msg: "skopeo login succeeded for {{ dockerhub_username }}"
+
+###############################################################################
+# Stage 3 — Collect images from Kubernetes and write lists
+###############################################################################
+- name: Stage 3 — Collect images from Kubernetes and write lists
+  hosts: k3s_server
+  gather_facts: no
+  become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/dockerhub.yml"
+  vars:
+    work_dir: "{{ playbook_dir }}/.image_sync"               # stored on router
+    images_list_file: "{{ work_dir }}/images.txt"
+    images_parsed_json: "{{ work_dir }}/images_parsed.json"
+    hub_repo_prefix_effective: "{{ hub_repo_prefix | default(dockerhub_username) }}"
+    registry_host_effective: "docker.io"
+
+  tasks:
+    - name: Ensure work dir exists on router (for outputs)
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: k3srouter
+      run_once: true
+
+    - name: Collect unique images from all namespaces
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if command -v kubectl >/dev/null 2>&1; then K=kubectl; else K='k3s kubectl'; fi
+        if [ -n "{{ kubeconfig | default('') }}" ] && [ -f "{{ kubeconfig | default('') }}" ]; then
+          KUBECONFIG="{{ kubeconfig }}" $K get pods -A -o json \
+          | jq -r '.items[] | (.spec.containers[]?.image, .spec.initContainers[]?.image)' \
+          | grep -v '^null$' | sort -u
+        else
+          $K get pods -A -o json \
+          | jq -r '.items[] | (.spec.containers[]?.image, .spec.initContainers[]?.image)' \
+          | grep -v '^null$' | sort -u
+        fi
+      args: { executable: /bin/bash }
+      register: raw_images
+      changed_when: false
+
+    - name: Write raw image list on router (images.txt)
+      ansible.builtin.copy:
+        dest: "{{ images_list_file }}"
+        mode: "0644"
+        content: "{{ (raw_images.stdout_lines | default([])) | join('\n') }}\n"
+      delegate_to: k3srouter
+      run_once: true
+
+    - name: Build parsed JSON map on router (name, tag, hub_repo, hub_ref)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import os, json
+        src   = os.environ["SRC_FILE"]
+        pref  = os.environ["HUB_PREFIX"]
+        reg   = os.environ["REG_HOST"]
+
+        def split_ref(ref: str):
+          digest = None
+          if "@sha256:" in ref:
+            ref, digest = ref.split("@", 1)
+          last = ref.rsplit("/", 1)[-1]
+          if ":" in last:
+            name, tag = ref.rsplit(":", 1)
+          else:
+            name, tag = ref, "latest"
+          base = name.split("/")[-1]
+          return {"source": ref, "name": base, "tag": tag, "digest": digest}
+
+        with open(src) as f:
+          lines = [l.strip() for l in f if l.strip()]
+
+        out = []
+        for ref in lines:
+          o = split_ref(ref)
+          hub_repo = f"{pref}/{o['name']}"
+          hub_ref  = f"{reg}/{hub_repo}:{o['tag']}"
+          o.update({"hub_repo": hub_repo, "hub_ref": hub_ref})
+          out.append(o)
+
+        print(json.dumps(out, indent=2))
+        PY
+      args: { executable: /bin/bash }
+      environment:
+        SRC_FILE: "{{ images_list_file }}"
+        HUB_PREFIX: "{{ hub_repo_prefix_effective }}"
+        REG_HOST: "{{ registry_host_effective }}"
+      register: parsed_json
+      changed_when: false
+      delegate_to: k3srouter
+      run_once: true
+
+    - name: Save images_parsed.json on router
+      ansible.builtin.copy:
+        dest: "{{ images_parsed_json }}"
+        mode: "0644"
+        content: "{{ parsed_json.stdout }}"
+      delegate_to: k3srouter
+      run_once: true
+
+    - name: Summary of discovered images
+      ansible.builtin.debug:
+        msg:
+          - "Found {{ (raw_images.stdout_lines | default([])) | length }} unique images."
+          - "Raw list: {{ images_list_file }}"
+          - "Parsed map: {{ images_parsed_json }}"
+
+###############################################################################
+# Stage 5 — Compute plan and push/replace as needed (portable, fixed)
+###############################################################################
+- name: Stage 5 — Compute plan and push/replace as needed
+  hosts: k3srouter_host
+  gather_facts: no
+  become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/dockerhub.yml"
+  vars:
+    work_dir: "{{ playbook_dir }}/.image_sync"
+    images_parsed_json: "{{ work_dir }}/images_parsed.json"
+    registry_host_effective: "docker.io"
+    hub_repo_prefix_effective: "{{ hub_repo_prefix | default(dockerhub_username) }}"
+    wanted_names: ["grafana", "influxdb", "jenkins"]   # only these three
+    # IMPORTANT: compute an effective bool; do NOT self-reference
+    ensure_latest_tag_effective: "{{ (ensure_latest_tag | default(false)) | bool }}"
+
+  tasks:
+    - name: Ensure images_parsed.json exists
+      ansible.builtin.stat:
+        path: "{{ images_parsed_json }}"
+      register: parsed_stat
+
+    - name: Fail with hint if missing
+      ansible.builtin.fail:
+        msg: "Missing {{ images_parsed_json }}. Run Stage 3 first (collect images)."
+      when: not parsed_stat.stat.exists
+
+    - name: Load parsed images (from Stage 3)
+      ansible.builtin.slurp:
+        src: "{{ images_parsed_json }}"
+      register: parsed_b64
+
+    - name: Filter to wanted images only
+      ansible.builtin.set_fact:
+        candidates: >-
+          {{
+            (parsed_b64.content | b64decode | from_json)
+            | selectattr('name','in', wanted_names) | list
+          }}
+
+    - name: Show candidates
+      ansible.builtin.debug:
+        msg:
+          - "Candidates ({{ candidates | length }}):"
+          - "{{ candidates }}"
+
+    - name: End play if no candidates
+      meta: end_play
+      when: (candidates | length) == 0
+
+    - name: Get source digests
+      ansible.builtin.shell: |
+        set -euo pipefail
+        src="docker://{{ item.source }}"
+        skopeo inspect "${src}" | jq -r '.Digest // .digest // (.manifests[0].digest // "")'
+      args: { executable: /bin/bash }
+      loop: "{{ candidates }}"
+      loop_control: { label: "{{ item.source }}" }
+      register: src_digests
+      changed_when: false
+
+    - name: Get destination digests (if exist)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        dest="docker://{{ registry_host_effective }}/{{ hub_repo_prefix_effective }}/{{ item.name }}:{{ item.tag }}"
+        if skopeo inspect "${dest}" >/dev/null 2>&1; then
+          skopeo inspect "${dest}" | jq -r '.Digest // .digest // (.manifests[0].digest // "")'
+        else
+          echo ""
+        fi
+      args: { executable: /bin/bash }
+      loop: "{{ candidates }}"
+      loop_control: { label: "{{ item.name }}:{{ item.tag }}" }
+      register: dst_digests
+      changed_when: false
+
+    - name: Initialize push_plan
+      ansible.builtin.set_fact:
+        push_plan: []
+
+    - name: Append each entry to push_plan (by index)
+      ansible.builtin.set_fact:
+        push_plan: "{{ push_plan + [ {
+          'name': candidates[idx].name,
+          'tag': candidates[idx].tag,
+          'source': candidates[idx].source,
+          'dest': 'docker://' ~ registry_host_effective ~ '/' ~ hub_repo_prefix_effective ~ '/' ~ candidates[idx].name ~ ':' ~ candidates[idx].tag,
+          'src_digest': (src_digests.results[idx | int].stdout | default('') | trim),
+          'dst_digest': (dst_digests.results[idx | int].stdout | default('') | trim),
+          'status': ((dst_digests.results[idx | int].stdout | default('') | trim) != '') | ternary('EXISTS','MISSING'),
+          'action': ((dst_digests.results[idx | int].stdout | default('') | trim) == '')
+                    | ternary('push',
+                              (((dst_digests.results[idx | int].stdout | default('') | trim)
+                                != (src_digests.results[idx | int].stdout | default('') | trim))
+                               | ternary('replace','nothing')))
+        } ] }}"
+      loop: "{{ range(0, (candidates | length)) | list }}"
+      loop_control:
+        loop_var: idx
+        label: "{{ candidates[idx].name }}:{{ candidates[idx].tag }}"
+
+    - name: Save push plan (for auditing)
+      ansible.builtin.copy:
+        dest: "{{ work_dir }}/push_plan.json"
+        mode: "0644"
+        content: "{{ push_plan | to_nice_json }}"
+      changed_when: false
+
+    - name: Execute copy for push/replace
+      ansible.builtin.shell: |
+        set -euo pipefail
+        skopeo copy --all "docker://{{ item.source }}" "{{ item.dest }}"
+      args: { executable: /bin/bash }
+      loop: "{{ push_plan }}"
+      loop_control: { label: "{{ item.dest }} ({{ item.action }})" }
+      when: item.action in ['push','replace']
+      register: copy_res
+      changed_when: item.action in ['push','replace']
+
+    - name: Optionally also push :latest tag
+      ansible.builtin.shell: |
+        set -euo pipefail
+        skopeo copy --all "docker://{{ item.source }}" \
+          "docker://{{ registry_host_effective }}/{{ hub_repo_prefix_effective }}/{{ item.name }}:latest"
+      args: { executable: /bin/bash }
+      loop: "{{ push_plan }}"
+      loop_control: { label: "{{ item.name }}:latest" }
+      when: ensure_latest_tag_effective and item.action in ['push','replace']
+      changed_when: false
+
+    - name: Summary by action
+      ansible.builtin.debug:
+        msg:
+          - "Total candidates: {{ push_plan | length }}"
+          - "Push: {{ (push_plan | selectattr('action','equalto','push') | list) | length }}"
+          - "Replace: {{ (push_plan | selectattr('action','equalto','replace') | list) | length }}"
+          - "Nothing: {{ (push_plan | selectattr('action','equalto','nothing') | list) | length }}"
+

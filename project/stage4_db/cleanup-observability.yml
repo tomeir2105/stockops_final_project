@@ -1,0 +1,149 @@
+---
+- name: "Cleanup Observability & Jenkins resources (keep PV data)"
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    ns: "{{ NAMESPACE | default('observability') }}"
+    pv_names:
+      - grafana-pv
+      - influxdb-pv
+      - jenkins-pv
+
+  tasks:
+    - name: "Detect kubectl (prefer kubectl, else k3s kubectl)"
+      shell: |
+        if command -v kubectl >/dev/null 2>&1; then
+          echo kubectl
+        else
+          echo "k3s kubectl"
+        fi
+      args: { executable: /bin/bash }
+      register: kubectl_cmd
+      changed_when: false
+
+    - name: "Check if namespace exists"
+      shell: |
+        {{ kubectl_cmd.stdout }} get ns {{ ns }} --no-headers >/dev/null 2>&1
+      args: { executable: /bin/bash }
+      register: ns_check
+      changed_when: false
+      failed_when: false
+
+    - name: "Skip cleanup when namespace is absent"
+      when: ns_check.rc != 0
+      debug:
+        msg: "Namespace {{ ns }} not found — skipping namespaced resource cleanup."
+
+    - block:
+        - name: "Scale Deployments to zero (stop respawns)"
+          shell: >
+            {{ kubectl_cmd.stdout }} -n {{ ns }} scale deploy grafana influxdb jenkins
+            --replicas=0 --timeout=60s --ignore-not-found
+          args: { executable: /bin/bash }
+          changed_when: false
+          failed_when: false
+
+        - name: "Delete pods for grafana/influxdb/jenkins (fast)"
+          shell: >
+            {{ kubectl_cmd.stdout }} -n {{ ns }} delete pod
+            --selector='app in (grafana,influxdb,jenkins)'
+            --ignore-not-found --wait=false
+          args: { executable: /bin/bash }
+          changed_when: false
+          failed_when: false
+
+        - name: "Delete Deployments (ignore if missing)"
+          shell: >
+            {{ kubectl_cmd.stdout }} -n {{ ns }}
+            delete deploy grafana influxdb jenkins --ignore-not-found --wait=true
+          args: { executable: /bin/bash }
+
+        - name: "Delete Services (ignore if missing)"
+          shell: >
+            {{ kubectl_cmd.stdout }} -n {{ ns }}
+            delete svc grafana grafana-nodeport influxdb influxdb-nodeport jenkins
+            --ignore-not-found --wait=true
+          args: { executable: /bin/bash }
+
+        - name: "Delete Secrets (ignore if missing)"
+          shell: >
+            {{ kubectl_cmd.stdout }} -n {{ ns }}
+            delete secret grafana-admin influxdb-secrets --ignore-not-found --wait=true
+          args: { executable: /bin/bash }
+
+        - name: "Delete ConfigMaps (ignore if missing)"
+          shell: >
+            {{ kubectl_cmd.stdout }} -n {{ ns }}
+            delete configmap grafana-datasources --ignore-not-found --wait=true
+          args: { executable: /bin/bash }
+
+        - name: "Delete PVCs (ignore if missing)"
+          shell: >
+            {{ kubectl_cmd.stdout }} -n {{ ns }}
+            delete pvc grafana-pvc influxdb-pvc jenkins-pvc --ignore-not-found --wait=true
+          args: { executable: /bin/bash }
+          register: pvc_delete
+          failed_when: false
+
+        - name: "Wait briefly after PVC delete"
+          pause:
+            seconds: 4
+      when: ns_check.rc == 0
+
+    # ---------------- PV RESET (so future apply binds cleanly) ----------------
+    - name: "Get PV phases (if they exist)"
+      shell: |
+        {{ kubectl_cmd.stdout }} get pv {{ item }} -o jsonpath='{.status.phase}' 2>/dev/null || echo NotFound
+      args: { executable: /bin/bash }
+      loop: "{{ pv_names }}"
+      register: pv_phase_results
+      changed_when: false
+
+    - name: "Delete stale PVs (Bound/Released/Failed) — data stays on NFS"
+      shell: |
+        {{ kubectl_cmd.stdout }} patch pv {{ item.item }} -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null 2>&1 || true
+        {{ kubectl_cmd.stdout }} delete pv {{ item.item }} --wait=false || true
+      args: { executable: /bin/bash }
+      loop: "{{ pv_phase_results.results }}"
+      when: item.stdout in ["Bound", "Released", "Failed"]
+      changed_when: true
+
+    - name: "Force-remove PV finalizers if deletion is stuck"
+      shell: |
+        if {{ kubectl_cmd.stdout }} get pv {{ item }} >/dev/null 2>&1; then
+          {{ kubectl_cmd.stdout }} patch pv {{ item }} --type=merge -p '{"metadata":{"finalizers":[]}}' || true
+        fi
+      args: { executable: /bin/bash }
+      loop: "{{ pv_names }}"
+      changed_when: false
+      failed_when: false
+
+    - name: "Wait for PV deletions to complete (up to 60s)"
+      shell: |
+        for i in $(seq 1 12); do
+          missing=0
+          for pv in {{ pv_names | join(' ') }}; do
+            if ! {{ kubectl_cmd.stdout }} get pv $pv >/dev/null 2>&1; then
+              missing=$((missing+1))
+            fi
+          done
+          if [ "$missing" -eq {{ pv_names | length }} ]; then
+            exit 0
+          fi
+          sleep 5
+        done
+        exit 1
+      args: { executable: /bin/bash }
+      register: pv_wait
+      changed_when: false
+      failed_when: pv_wait.rc != 0
+
+    - name: "Summary"
+      debug:
+        msg:
+          - "Cleanup complete for namespace {{ ns }}."
+

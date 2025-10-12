@@ -1,0 +1,176 @@
+---
+- name: Restart pods and recreate PVCs (static, handles stuck PVCs)
+  hosts: k3s_server
+  run_once: true
+  become: yes
+  gather_facts: no
+
+  vars_files:
+    - "{{ playbook_dir }}/vars.yml"
+
+  vars:
+    KUBECONFIG_PATH: /etc/rancher/k3s/k3s.yaml
+    NS: "{{ NAMESPACE | default('stockops') }}"
+    KUBECTL: "{{ KUBECTL | default('kubectl') }}"
+
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG_PATH }}"
+    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+  pre_tasks:
+    - name: Assert APP_PVCS is defined
+      assert:
+        that:
+          - APP_PVCS is defined
+          - APP_PVCS | length > 0
+        fail_msg: "APP_PVCS is missing/empty in vars.yml"
+
+  tasks:
+    - name: Show plan
+      debug:
+        msg:
+          - "Namespace: {{ NS }}"
+          - "PVCs: {{ APP_PVCS | map(attribute='name') | list }}"
+
+    - name: Delete ALL pods in namespace
+      shell: |
+        set -e
+        {{ KUBECTL }} delete pod --all -n {{ NS }} --grace-period=0 --force || true
+      args: { executable: /bin/bash }
+      changed_when: true
+
+    - name: Delete PVCs if they exist
+      shell: |
+        set -e
+        {{ KUBECTL }} -n {{ NS }} delete pvc "{{ item.name }}" --wait=false || true
+      args: { executable: /bin/bash }
+      loop: "{{ APP_PVCS }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: true
+
+    - pause:
+        seconds: 3
+
+    - name: Force-remove finalizers from any PVC still Terminating
+      shell: |
+        set -e
+        stuck="$({{ KUBECTL }} -n {{ NS }} get pvc -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{"\n"}{end}' || true)"
+        [ -z "$stuck" ] && exit 0
+        echo "$stuck" | while read pvc; do
+          [ -z "$pvc" ] && continue
+          {{ KUBECTL }} -n {{ NS }} patch pvc "$pvc" --type=merge -p '{"metadata":{"finalizers":null}}' || true
+        done
+      args: { executable: /bin/bash }
+      changed_when: true
+
+    - name: Ensure all targeted PVCs are gone (best-effort)
+      shell: |
+        set -e
+        left="$({{ KUBECTL }} -n {{ NS }} get pvc -o jsonpath='{.items[*].metadata.name}' || true)"
+        for pvc in {{ APP_PVCS | map(attribute='name') | join(' ') }}; do
+          echo "$left" | grep -qw "$pvc" && {{ KUBECTL }} -n {{ NS }} delete pvc "$pvc" --wait=false || true
+        done
+      args: { executable: /bin/bash }
+      changed_when: false
+
+    - name: Clear claimRef on each backing PV so new PVCs can bind
+      shell: |
+        set -e
+        pv="{{ item.pv }}"
+        {{ KUBECTL }} patch pv "$pv" --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]' || true
+      args: { executable: /bin/bash }
+      loop: "{{ APP_PVCS }}"
+      loop_control: { label: "{{ item.pv }}" }
+      changed_when: true
+
+    # ======== NEW: read PV specs and build maps (SC, size, modes) ========
+    - name: Build PV name list (from APP_PVCS)
+      set_fact:
+        pv_names: "{{ APP_PVCS | map(attribute='pv') | list }}"
+
+    - name: Read PV storageClassName
+      command:
+        argv: [ "{{ KUBECTL }}", "get", "pv", "{{ item }}", "-o", "jsonpath={.spec.storageClassName}" ]
+      loop: "{{ pv_names }}"
+      register: _pv_sc
+      changed_when: false
+      failed_when: false
+
+    - name: Read PV capacity (storage)
+      command:
+        argv: [ "{{ KUBECTL }}", "get", "pv", "{{ item }}", "-o", "jsonpath={.spec.capacity.storage}" ]
+      loop: "{{ pv_names }}"
+      register: _pv_size
+      changed_when: false
+      failed_when: false
+
+    - name: Read PV accessModes
+      command:
+        argv: [ "{{ KUBECTL }}", "get", "pv", "{{ item }}", "-o", "jsonpath={.spec.accessModes[*]}" ]
+      loop: "{{ pv_names }}"
+      register: _pv_modes
+      changed_when: false
+      failed_when: false
+
+    - name: Build pv_sc_map / pv_size_map / pv_modes_map
+      set_fact:
+        pv_sc_map:   "{{ dict(_pv_sc.results   | map(attribute='item') | list | zip(_pv_sc.results   | map(attribute='stdout') | list)) }}"
+        pv_size_map: "{{ dict(_pv_size.results | map(attribute='item') | list | zip(_pv_size.results | map(attribute='stdout') | list)) }}"
+        pv_modes_map_raw: "{{ dict(_pv_modes.results | map(attribute='item') | list | zip(_pv_modes.results | map(attribute='stdout') | list)) }}"
+
+    - name: Normalize pv_modes_map to lists
+      set_fact:
+        pv_modes_map: "{{ dict(pv_modes_map_raw | dict2items | map(attribute='key') | list | zip(pv_modes_map_raw | dict2items | map(attribute='value') | map('regex_replace','\\s+',' ') | map('split',' ') | list)) }}"
+      when: pv_modes_map_raw is defined
+
+    # ======== Render PVCs using PV-effective values ========
+    - name: Render PVC manifests
+      copy:
+        dest: "/tmp/recreate-pvc-{{ item.name }}.yaml"
+        mode: "0644"
+        content: |
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: {{ item.name }}
+            namespace: {{ NS }}
+          spec:
+            accessModes: {{ (pv_modes_map.get(item.pv) | default(item.modes)) | to_json }}
+            resources:
+              requests:
+                storage: {{ pv_size_map.get(item.pv) | default(item.size) }}
+            storageClassName: {{ (pv_sc_map.get(item.pv) | default(item.sc | default(''))) | to_json }}
+            volumeName: {{ item.pv | to_json }}
+      loop: "{{ APP_PVCS }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Apply PVCs
+      shell: |
+        set -e
+        {{ KUBECTL }} apply -f "/tmp/recreate-pvc-{{ item.name }}.yaml"
+      args: { executable: /bin/bash }
+      loop: "{{ APP_PVCS }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: true
+
+    - name: Wait for all PVCs to be Bound
+      shell: |
+        set -e
+        {{ KUBECTL }} -n {{ NS }} wait pvc/{{ item.name }} --for=jsonpath='{.status.phase}'=Bound --timeout=180s
+      args: { executable: /bin/bash }
+      loop: "{{ APP_PVCS }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: false
+
+    - name: Show pods after PVCs are ready
+      shell: "{{ KUBECTL }} -n {{ NS }} get pods -o wide"
+      args: { executable: /bin/bash }
+      register: pods_now
+      changed_when: false
+
+    - debug:
+        msg:
+          - "PVCs recreated and Bound in {{ NS }}."
+          - "{{ pods_now.stdout }}"
+

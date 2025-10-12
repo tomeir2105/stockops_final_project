@@ -1,0 +1,52 @@
+---
+# Verifies jenkins-plugin-cli is present by printing its version.
+# No installs, no changes—just a check.
+
+- name: Test jenkins-plugin-cli version
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+
+  vars:
+    kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    - name: Pick kubectl or 'k3s kubectl'
+      shell: "command -v kubectl >/dev/null 2>&1 && echo kubectl || echo 'k3s kubectl'"
+      args: { executable: /bin/bash }
+      register: kubectl_cmd
+      changed_when: false
+
+    - name: Find Jenkins pod and namespace
+      shell: >
+        {{ kubectl_cmd.stdout }} get pods -A -l app=jenkins
+        -o jsonpath='{.items[0].metadata.namespace} {.items[0].metadata.name}'
+      args: { executable: /bin/bash }
+      register: pod_info
+      changed_when: false
+      failed_when: pod_info.stdout | trim == ""
+
+    - name: Set facts for pod and namespace
+      set_fact:
+        jenkins_ns: "{{ (pod_info.stdout | trim).split(' ')[0] }}"
+        jenkins_pod: "{{ (pod_info.stdout | trim).split(' ')[1] }}"
+
+    - name: Run jenkins-plugin-cli --version with JAVA on PATH
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jenkins_ns }}"
+        exec -i "{{ jenkins_pod }}" -- bash -lc
+        'PATH=/opt/java/openjdk/bin:$PATH jenkins-plugin-cli --version'
+      args: { executable: /bin/bash }
+      register: version_out
+      changed_when: false
+
+    - name: Show version
+      debug:
+        msg:
+          - "Namespace: {{ jenkins_ns }}"
+          - "Pod: {{ jenkins_pod }}"
+          - "jenkins-plugin-cli version: {{ version_out.stdout | trim }}"
+

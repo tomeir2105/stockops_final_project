@@ -1,0 +1,56 @@
+---
+# COMMON TASKS — included by server and agents
+# Safe, idempotent prep for K3s nodes.
+
+- name: Ensure /etc/rancher/k3s exists
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: yes
+  tags: ['k8s','common']
+
+- name: Ensure br_netfilter module is present
+  ansible.builtin.modprobe:
+    name: br_netfilter
+    state: present
+  become: yes
+  when: ansible_os_family == 'Debian' or ansible_os_family == 'RedHat'
+  tags: ['k8s','sysctl','common']
+
+- name: Write Kubernetes sysctl config
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+    owner: root
+    group: root
+    mode: "0644"
+  become: yes
+  tags: ['k8s','sysctl','common']
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  become: yes
+  changed_when: false
+  tags: ['k8s','sysctl','common']
+
+- name: Disable swap immediately if enabled
+  ansible.builtin.command: swapoff -a
+  become: yes
+  when: (ansible_swaptotal_mb | default(0)) | int > 0
+  changed_when: false
+  tags: ['k8s','swap','common']
+
+- name: Ensure swap is disabled on boot (comment out swap entries)
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^\s*([^#]\S+\s+\S+\s+swap\s+.*)$'
+    line: '# \1'
+    backrefs: yes
+  become: yes
+  tags: ['k8s','swap','common']

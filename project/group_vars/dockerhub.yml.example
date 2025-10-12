@@ -1,0 +1,2 @@
+DOCKERHUB_USER: "<your_dockerhub_username>"
+DOCKERHUB_TOKEN: "<your_dockerhub_token>"

@@ -1,0 +1,104 @@
+---
+- name: Clean & rebind NFS PVs to current PVCs
+  hosts: k3srouter_host
+  gather_facts: false
+  become: false
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  # Map PVs to the PVCs you want them bound to.
+  # Adjust/add pairs as needed.
+  vars:
+    NAMESPACE: "{{ lookup('vars', 'K8S_NAMESPACE') | default('stockops') }}"
+    PV_PVC_MAP:
+      - { pv: grafana-pv,  pvc: grafana-pvc }
+      - { pv: influxdb-pv, pvc: influxdb-pvc }
+
+  pre_tasks:
+    - name: Assert kubectl variables are present
+      assert:
+        that:
+          - KUBECONFIG is defined
+          - (KUBECONFIG | length) > 0
+          - NAMESPACE is defined
+          - (NAMESPACE | length) > 0
+          - PV_PVC_MAP | length > 0
+        fail_msg: "Missing KUBECONFIG, NAMESPACE, or PV_PVC_MAP."
+
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG }}"
+
+  tasks:
+    - name: Show current PV/PVC state (pre)
+      command: kubectl get pv,pvc -A
+      register: _pre
+      changed_when: false
+
+    - name: Debug pre-state
+      debug:
+        var: _pre.stdout_lines
+
+    - name: Fetch PV JSON
+      command: kubectl get pv {{ item.pv }} -o json
+      register: _pv_json
+      loop: "{{ PV_PVC_MAP }}"
+      loop_control:
+        label: "{{ item.pv }}"
+      changed_when: false
+      failed_when: _pv_json.rc != 0
+
+    - name: Compute PV objects
+      set_fact:
+        _pv_objs: "{{ _pv_json.results | map(attribute='stdout') | map('from_json') | list }}"
+
+    - name: Clear claimRef on PVs that are Released or bound to an old claim
+      vars:
+        _pv: "{{ _pv_objs[idx] }}"
+        _want_pvc: "{{ PV_PVC_MAP[idx].pvc }}"
+        _claim: "{{ _pv.spec.claimRef | default({}) }}"
+        _claim_name: "{{ _claim.name | default('') }}"
+        _claim_ns: "{{ _claim.namespace | default('') }}"
+        _needs_clear: "{{ (_claim_name != '' and _claim_ns == NAMESPACE and _claim_name != _want_pvc) or (_pv.status.phase | default('') == 'Released') }}"
+      command: >
+        kubectl patch pv {{ _pv.metadata.name }} --type=merge
+        -p {"spec":{"claimRef":null}}
+      loop: "{{ range(0, PV_PVC_MAP | length) | list }}"
+      loop_control:
+        label: "{{ _pv_objs[item].metadata.name }}"
+      when: _needs_clear
+      register: _clear_ref
+      changed_when: _clear_ref.rc == 0
+
+    - name: Force-bind PVCs to PVs (set spec.volumeName on PVC)
+      command: >
+        kubectl patch pvc {{ item.pvc }} -n {{ NAMESPACE }}
+        --type=merge -p {"spec":{"volumeName":"{{ item.pv }}"}}
+      loop: "{{ PV_PVC_MAP }}"
+      loop_control:
+        label: "{{ item.pvc }}"
+      register: _bind_pvc
+      changed_when: _bind_pvc.rc == 0
+      failed_when: _bind_pvc.rc != 0
+
+    - name: Wait for PVCs to be Bound
+      shell: |
+        set -e
+        kubectl get pvc {{ item.pvc }} -n {{ NAMESPACE }} -o jsonpath='{.status.phase}'
+      register: _pvc_phase
+      until: _pvc_phase.stdout == "Bound"
+      retries: 20
+      delay: 3
+      loop: "{{ PV_PVC_MAP }}"
+      loop_control:
+        label: "{{ item.pvc }}"
+      changed_when: false
+
+    - name: Show current PV/PVC state (post)
+      command: kubectl get pv,pvc -n {{ NAMESPACE }}
+      register: _post
+      changed_when: false
+
+    - name: Debug post-state
+      debug:
+        var: _post.stdout_lines
+

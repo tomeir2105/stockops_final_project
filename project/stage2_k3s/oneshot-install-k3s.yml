@@ -1,0 +1,375 @@
+---
+# oneshot-install-k3s.yml — install/repair full cluster (server then agents)
+
+###############################################################################
+# Play A: k3s SERVER
+###############################################################################
+- name: Install k3s server if missing
+  hosts: k3s_server
+  become: yes
+  gather_facts: yes
+  vars:
+    k3s_server_ip: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    k3s_async_timeout: 3600
+    k3s_poll_interval: 15
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+  pre_tasks:
+    # --- Enable cgroup v2 memory (required by k3s) and reboot if changed ---
+    - name: Stat /boot/firmware/cmdline.txt
+      ansible.builtin.stat:
+        path: /boot/firmware/cmdline.txt
+      register: cmd_fw
+
+    - name: Stat /boot/cmdline.txt
+      ansible.builtin.stat:
+        path: /boot/cmdline.txt
+      register: cmd_boot
+
+    - name: Pick cmdline path
+      ansible.builtin.set_fact:
+        cmdline_path: >-
+          {{ '/boot/firmware/cmdline.txt' if cmd_fw.stat.exists
+             else '/boot/cmdline.txt' if cmd_boot.stat.exists
+             else '' }}
+
+    - name: Fail if no cmdline.txt found
+      ansible.builtin.fail:
+        msg: "Could not find cmdline.txt (checked /boot/firmware/cmdline.txt and /boot/cmdline.txt)"
+      when: cmdline_path == ''
+
+    - name: Read current cmdline
+      ansible.builtin.slurp:
+        src: "{{ cmdline_path }}"
+      register: cmdline_raw
+
+    - name: Remember current cmdline and required flags
+      ansible.builtin.set_fact:
+        _cmdline_current: "{{ (cmdline_raw.content | b64decode).strip() }}"
+        _flags:
+          - cgroup_memory=1
+          - cgroup_enable=memory
+          - systemd.unified_cgroup_hierarchy=1
+
+    - name: Compose updated cmdline string
+      ansible.builtin.set_fact:
+        _cmdline_new: >-
+          {{ _cmdline_current }}
+          {% for f in _flags if f not in _cmdline_current %} {{ f }}{% endfor %}
+
+    - name: Write cmdline if changed
+      ansible.builtin.copy:
+        dest: "{{ cmdline_path }}"
+        content: "{{ _cmdline_new | regex_replace('\\s+', ' ') }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+      when: _cmdline_new | trim != _cmdline_current | trim
+      register: cmdline_changed
+
+    - name: Reboot for cgroup changes
+      ansible.builtin.reboot:
+        msg: "Rebooting to enable cgroup v2 memory"
+        connect_timeout: 30
+        reboot_timeout: 600
+        pre_reboot_delay: 2
+        post_reboot_delay: 10
+      when: cmdline_changed is changed
+    # --- end cgroup v2 enable ---
+
+    - name: Ensure apt uses IPv4 (prevents hang on some networks)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        content: |
+          Acquire::ForceIPv4 "true";
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Recover from any interrupted dpkg
+      ansible.builtin.command: dpkg --configure -a
+      changed_when: false
+
+    - name: Update apt cache (wait for locks, retry)
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        force_apt_get: yes
+        lock_timeout: 600
+      register: apt_update_srv
+      retries: 5
+      delay: 10
+      until: apt_update_srv is succeeded
+
+    - name: Install prerequisites (curl, CA certs)
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+        state: present
+        force_apt_get: yes
+        lock_timeout: 600
+
+    - name: Check if k3s server unit exists
+      ansible.builtin.stat:
+        path: /etc/systemd/system/k3s.service
+      register: k3s_unit
+
+    - name: Check HTTPS connectivity to get.k3s.io (server, with retries)
+      ansible.builtin.command: curl -sS --head https://get.k3s.io
+      register: https_check_srv
+      changed_when: false
+      retries: 5
+      delay: 5
+      until: https_check_srv.rc == 0
+      when: not k3s_unit.stat.exists
+
+  tasks:
+    # --- Server kubelet tuning (give nodes some slack) ---
+    - name: Ensure config dir (server)
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: Write /etc/rancher/k3s/config.yaml (server kubelet tuning)
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        mode: "0644"
+        content: |
+          node-name: "{{ inventory_hostname | lower }}"
+          kubelet-arg:
+            - "eviction-hard=memory.available<200Mi,nodefs.available<5%,imagefs.available<5%"
+            - "eviction-soft=memory.available<300Mi"
+            - "eviction-soft-grace-period=memory.available=2m"
+            - "system-reserved=cpu=100m,memory=256Mi"
+            - "kube-reserved=cpu=150m,memory=384Mi"
+            - "image-gc-high-threshold=80"
+            - "image-gc-low-threshold=70"
+    # ------------------------------------------------------
+
+    - name: Install k3s server (async) if missing
+      ansible.builtin.shell: |
+        set -e
+        curl -sfL https://get.k3s.io | \
+          K3S_KUBECONFIG_MODE=644 \
+          INSTALL_K3S_EXEC="server" \
+          sh -
+      args:
+        executable: /bin/bash
+      when: not k3s_unit.stat.exists
+      async: "{{ k3s_async_timeout }}"
+      poll: "{{ k3s_poll_interval }}"
+      register: k3s_server_install
+
+    - name: Ensure k3s server is enabled and started
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait until k3s service is active
+      ansible.builtin.command: systemctl is-active --quiet k3s
+      register: k3s_active
+      retries: 600
+      delay: 5
+      changed_when: false
+      until: k3s_active.rc == 0
+
+    - name: Wait for API to listen on 6443
+      ansible.builtin.wait_for:
+        host: "{{ k3s_server_ip }}"
+        port: 6443
+        state: started
+        delay: 2
+        timeout: 600
+
+    - name: Ensure node-token exists on the server
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/server/node-token
+      register: token_stat
+
+    - name: Fail with hint if node-token is missing
+      ansible.builtin.fail:
+        msg: >
+          Node token not found. Something is wrong with server install.
+          Expected: /var/lib/rancher/k3s/server/node-token
+      when: not token_stat.stat.exists
+
+###############################################################################
+# Play B: k3s AGENTS  (enable cgroups on workers + join with token file)
+###############################################################################
+- name: Install k3s agents
+  hosts: k3s_workers
+  become: yes
+  gather_facts: yes
+  vars:
+    k3s_server_host: "{{ groups['k3s_server'][0] }}"
+    k3s_server_ip: "{{ hostvars[groups['k3s_server'][0]].ansible_host | default(groups['k3s_server'][0]) }}"
+    k3s_async_timeout: 3600
+    k3s_poll_interval: 15
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+  pre_tasks:
+    # --- Enable cgroup v2 memory on workers (RPi/Debian firmware path ONLY) ---
+    - name: Ensure /boot/firmware/cmdline.txt exists
+      ansible.builtin.stat:
+        path: /boot/firmware/cmdline.txt
+      register: cmd_fw
+
+    - name: Fail if /boot/firmware/cmdline.txt is missing
+      ansible.builtin.fail:
+        msg: "/boot/firmware/cmdline.txt not found (policy: we do NOT touch /boot/cmdline.txt)."
+      when: not cmd_fw.stat.exists
+
+    - name: Read current cmdline
+      ansible.builtin.slurp:
+        src: /boot/firmware/cmdline.txt
+      register: cmdline_raw
+
+    - name: Remember current cmdline and required flags (workers)
+      ansible.builtin.set_fact:
+        _cmdline_current: "{{ (cmdline_raw.content | b64decode).strip() }}"
+        _flags: [ "cgroup_memory=1", "cgroup_enable=memory", "systemd.unified_cgroup_hierarchy=1" ]
+
+    - name: Build updated cmdline with required flags (workers)
+      ansible.builtin.set_fact:
+        _cmdline_new: >-
+          {{ _cmdline_current }}
+          {% for f in _flags if f not in _cmdline_current %} {{ f }}{% endfor %}
+
+    - name: Write cmdline if changed
+      ansible.builtin.copy:
+        dest: /boot/firmware/cmdline.txt
+        content: "{{ _cmdline_new | regex_replace('\\s+', ' ') }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+      when: _cmdline_new | trim != _cmdline_current | trim
+      register: cmdline_changed
+
+    - name: Reboot workers for cgroup changes
+      ansible.builtin.reboot:
+        msg: "Rebooting to enable cgroup v2 memory"
+        connect_timeout: 30
+        reboot_timeout: 600
+        pre_reboot_delay: 2
+        post_reboot_delay: 10
+      when: cmdline_changed is changed
+    # --- end cgroup enable ---
+
+    # Minimal bootstrap needed post-reboot
+    - name: Ensure apt uses IPv4 (prevents hang on some networks)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        content: "Acquire::ForceIPv4 \"true\";\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install prerequisites (curl, CA certs)
+      ansible.builtin.apt:
+        name: [curl, ca-certificates]
+        state: present
+        force_apt_get: yes
+        lock_timeout: 600
+
+    # --- Fetch the real token from the server (no localhost facts) ---
+    - name: Verify server token exists (delegated)
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/server/node-token
+      delegate_to: "{{ k3s_server_host }}"
+      become: yes
+      register: tokenstat
+      run_once: true
+
+    - name: Fail with hint if server not installed yet
+      ansible.builtin.fail:
+        msg: >
+          Node token not found on {{ k3s_server_host }}.
+          Install k3s server first, then re-run.
+          Expected: /var/lib/rancher/k3s/server/node-token
+      when: not tokenstat.stat.exists
+      run_once: true
+
+    - name: Read server node-token (once)
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      delegate_to: "{{ k3s_server_host }}"
+      become: yes
+      register: node_token_raw
+      run_once: true
+
+    - name: Decode join token (controller-side fact)
+      ansible.builtin.set_fact:
+        k3s_join_token: "{{ node_token_raw.content | b64decode | trim }}"
+      run_once: true
+
+  tasks:
+    - name: Ensure config dir
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: Write join token file on worker
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/node-token
+        mode: "0600"
+        content: "{{ k3s_join_token }}"
+
+    - name: Write /etc/rancher/k3s/config.yaml
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        mode: "0644"
+        content: |
+          server: https://{{ k3s_server_ip }}:6443
+          node-name: "{{ inventory_hostname | lower }}"
+          kubelet-arg:
+            - "eviction-hard=memory.available<200Mi,nodefs.available<5%,imagefs.available<5%"
+            - "eviction-soft=memory.available<300Mi"
+            - "eviction-soft-grace-period=memory.available=2m"
+            - "system-reserved=cpu=100m,memory=256Mi"
+            - "kube-reserved=cpu=150m,memory=384Mi"
+            - "image-gc-high-threshold=80"
+            - "image-gc-low-threshold=70"
+
+    - name: Run k3s agent installer (async)
+      ansible.builtin.shell: |
+        set -e
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_TYPE=agent \
+          K3S_URL=https://{{ k3s_server_ip }}:6443 \
+          K3S_TOKEN_FILE=/etc/rancher/k3s/node-token \
+          sh -
+      args:
+        executable: /bin/bash
+      async: "{{ k3s_async_timeout }}"
+      poll: "{{ k3s_poll_interval }}"
+      register: k3s_install
+
+    - name: Confirm k3s-agent unit file exists
+      ansible.builtin.stat:
+        path: /etc/systemd/system/k3s-agent.service
+      register: agent_unit_stat
+
+    - name: Fail if k3s-agent unit missing (show installer output)
+      ansible.builtin.fail:
+        msg: |
+          k3s agent did not install a systemd unit.
+          --- installer stdout ---
+          {{ k3s_install.stdout | default('') }}
+          --- installer stderr ---
+          {{ k3s_install.stderr | default('') }}
+      when: not agent_unit_stat.stat.exists
+
+    - name: Start and enable k3s-agent
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: started
+        enabled: yes
+        daemon_reload: yes
+

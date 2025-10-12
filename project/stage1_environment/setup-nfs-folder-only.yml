@@ -1,0 +1,137 @@
+---
+- name: NFS | Folder-only export on local disk (self-healing)
+  hosts: k3srouter_host
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  # Pin the vars into play scope (prevents shadowing)
+  vars:
+    NFS_MOUNTPOINT: "{{ lookup('vars', 'NFS_MOUNTPOINT') }}"
+    NFS_EXPORTS_FILE: "{{ lookup('vars', 'NFS_EXPORTS_FILE') }}"
+    NFS_ALLOWED_CIDR: "{{ lookup('vars', 'NFS_ALLOWED_CIDR') }}"
+    NFS_EXPORT_OPTS: "{{ lookup('vars', 'NFS_EXPORT_OPTS') }}"
+    TARGET_USER: "{{ lookup('vars', 'TARGET_USER') | default('user') }}"
+    # Compute the systemd mount unit for /mnt/k3s_storage -> mnt-k3s_storage.mount
+    _mount_unit: >-
+      {{ (NFS_MOUNTPOINT | regex_replace('^/','') | regex_replace('/','-')) ~ '.mount' }}
+
+  pre_tasks:
+    - name: Assert required vars exist
+      assert:
+        that:
+          - NFS_MOUNTPOINT is string and NFS_MOUNTPOINT | length > 0
+          - NFS_EXPORTS_FILE is string and NFS_EXPORTS_FILE | length > 0
+          - NFS_ALLOWED_CIDR is string and NFS_ALLOWED_CIDR | length > 0
+          - NFS_EXPORT_OPTS is string and NFS_EXPORT_OPTS | length > 0
+          - TARGET_USER is string and TARGET_USER | length > 0
+        fail_msg: "Missing one or more required NFS vars (NFS_MOUNTPOINT, NFS_EXPORTS_FILE, NFS_ALLOWED_CIDR, NFS_EXPORT_OPTS, TARGET_USER)."
+
+  handlers:
+    - name: systemd daemon-reload
+      command: systemctl daemon-reload
+
+  tasks:
+    ###########################################################################
+    # 1) Clean up stale mounts and fstab entries for NFS_MOUNTPOINT
+    ###########################################################################
+    - name: Remove any fstab line that mounts {{ NFS_MOUNTPOINT }} from a device/label/uuid
+      lineinfile:
+        path: /etc/fstab
+        state: absent
+        regexp: "^[#\\s]*(LABEL=|UUID=|/dev/[^ \\t]+)\\s+{{ NFS_MOUNTPOINT | regex_escape() }}\\b"
+      notify: systemd daemon-reload
+
+    - name: Remove any loopback NFS fstab line for {{ NFS_MOUNTPOINT }}
+      lineinfile:
+        path: /etc/fstab
+        state: absent
+        regexp: "^\\S+:{{ NFS_MOUNTPOINT | regex_escape() }}\\s+{{ NFS_MOUNTPOINT | regex_escape() }}\\b"
+      notify: systemd daemon-reload
+
+    - name: Disable and stop generated mount unit if present
+      command: "systemctl disable --now {{ _mount_unit }}"
+      register: _disable_mount_unit
+      failed_when: false
+      changed_when: "'Removed' in _disable_mount_unit.stdout or 'disabled' in _disable_mount_unit.stdout"
+
+    - name: If {{ NFS_MOUNTPOINT }} is mounted, unmount it (covers accidental NFS loopback)
+      shell: |
+        set -e
+        if mountpoint -q "{{ NFS_MOUNTPOINT }}"; then
+          umount -l "{{ NFS_MOUNTPOINT }}"
+        fi
+      args: { executable: /bin/bash }
+      changed_when: false
+
+    ###########################################################################
+    # 2) Ensure local folder exists with proper ownership/mode
+    ###########################################################################
+    - name: Ensure base path exists on local filesystem (not mounted)
+      file:
+        path: "{{ NFS_MOUNTPOINT }}"
+        state: directory
+        owner: "{{ TARGET_USER }}"
+        group: "{{ TARGET_USER }}"
+        mode: "0775"
+
+    - name: Create application subdirectories (recursive, creates parents)
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default(TARGET_USER) }}"
+        group: "{{ item.group | default(TARGET_USER) }}"
+        mode: "{{ item.mode | default('0775') }}"
+        recurse: yes
+      loop: "{{ APP_DIRS | default([]) }}"
+
+    ###########################################################################
+    # 3) Install services, write exports, and start NFS cleanly
+    ###########################################################################
+    - name: Install NFS packages
+      package:
+        name:
+          - nfs-kernel-server
+          - nfs-common
+          - rpcbind
+        state: present
+
+    - name: Write exports file
+      copy:
+        dest: "{{ NFS_EXPORTS_FILE }}"
+        mode: "0644"
+        content: |
+          # Managed by Ansible — DO NOT EDIT
+          {{ NFS_MOUNTPOINT }} {{ NFS_ALLOWED_CIDR }}({{ NFS_EXPORT_OPTS }})
+
+    - name: Reload exports
+      command: exportfs -ra
+
+    - name: Enable/start rpcbind
+      service:
+        name: rpcbind
+        state: started
+        enabled: true
+
+    - name: Enable/start NFS
+      service:
+        name: nfs-kernel-server
+        state: started
+        enabled: true
+
+    ###########################################################################
+    # 4) Verify (no Jinja-in-string warning)
+    ###########################################################################
+    - name: VERIFY | export is present
+      command: exportfs -v
+      register: _exports
+      changed_when: false
+
+    - name: VERIFY | assert base export is present
+      assert:
+        that:
+          - NFS_MOUNTPOINT in _exports.stdout
+        success_msg: "Export for {{ NFS_MOUNTPOINT }} is present."
+        fail_msg: "Expected export for {{ NFS_MOUNTPOINT }} not found.\nGot:\n{{ _exports.stdout }}"
+

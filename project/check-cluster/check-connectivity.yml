@@ -1,0 +1,41 @@
+---
+# check-connectivity.yml — Verify network, DNS, and routing on all cluster nodes
+
+- name: Check k3s cluster connectivity
+  hosts: k3s
+  gather_facts: no
+  become: yes
+  tasks:
+
+    - name: Check default route exists
+      command: ip route show default
+      register: route_out
+      changed_when: false
+      failed_when: route_out.rc != 0
+    - debug:
+        msg: "Default route: {{ route_out.stdout }}"
+
+    - name: Check external IP connectivity (ping 8.8.8.8)
+      command: ping -c 3 8.8.8.8
+      register: ping_ip
+      changed_when: false
+      failed_when: ping_ip.rc != 0
+    - debug:
+        msg: "Ping 8.8.8.8 output: {{ ping_ip.stdout_lines }}"
+
+    - name: Check DNS resolution (google.com)
+      command: getent hosts google.com
+      register: dns_out
+      changed_when: false
+      failed_when: dns_out.rc != 0
+    - debug:
+        msg: "DNS resolution for google.com: {{ dns_out.stdout }}"
+
+    - name: Check HTTPS connectivity
+      command: curl -I -s https://www.google.com
+      register: https_out
+      changed_when: false
+      failed_when: https_out.rc != 0
+    - debug:
+        msg: "HTTPS check: {{ https_out.stdout_lines | default('no output') }}"
+

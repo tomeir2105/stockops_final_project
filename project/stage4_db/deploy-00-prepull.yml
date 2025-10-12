@@ -1,0 +1,117 @@
+---
+- name: Configure registries and pre-pull images for observability
+  hosts: k3s
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+    - "{{ playbook_dir }}/../group_vars/dockerhub.yml"
+
+  pre_tasks:
+    # --- Detect k3s unit (server or agent) and ensure it's running ---
+    - name: Detect k3s systemd unit (server or agent)
+      ansible.builtin.shell: |
+        set -e
+        if systemctl list-unit-files | grep -q '^k3s\.service'; then
+          echo k3s
+        elif systemctl list-unit-files | grep -q '^k3s-agent\.service'; then
+          echo k3s-agent
+        else
+          echo none
+        fi
+      args: { executable: /bin/bash }
+      register: detect_unit
+      changed_when: false
+
+    - name: Set fact for k3s unit
+      set_fact:
+        k3s_unit: "{{ detect_unit.stdout | trim }}"
+
+    - name: Start k3s service if available
+      ansible.builtin.shell: |
+        set -e
+        if [ "{{ k3s_unit }}" = "k3s" ] || [ "{{ k3s_unit }}" = "k3s-agent" ]; then
+          systemctl start "{{ k3s_unit }}"
+          systemctl enable "{{ k3s_unit }}" || true
+        fi
+      args: { executable: /bin/bash }
+      changed_when: false
+
+    - name: Wait for containerd socket (skip if k3s not installed)
+      ansible.builtin.wait_for:
+        path: /run/k3s/containerd/containerd.sock
+        state: present
+        timeout: 90
+      when: k3s_unit != "none"
+
+    # --- Write a minimal registries.yaml for auth (if you rely on Docker Hub rate-limit/auth) ---
+    - name: Ensure /etc/rancher/k3s exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: Configure Docker Hub auth (registries.yaml)
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: "0644"
+        content: |
+          mirrors:
+            "docker.io":
+              endpoint:
+                - "https://registry-1.docker.io"
+          configs:
+            "registry-1.docker.io":
+              auth:
+                username: "{{ dockerhub_username }}"
+                password: "{{ dockerhub_password }}"
+      register: regfile
+
+    - name: Restart k3s to pick up registries.yaml (if file changed and unit exists)
+      ansible.builtin.service:
+        name: "{{ k3s_unit }}"
+        state: restarted
+      when:
+        - k3s_unit != "none"
+        - regfile is changed
+
+    - name: Wait for containerd socket after restart
+      ansible.builtin.wait_for:
+        path: /run/k3s/containerd/containerd.sock
+        state: present
+        timeout: 90
+      when: k3s_unit != "none"
+
+  tasks:
+    - name: Skip pre-pull on hosts without k3s installed
+      ansible.builtin.debug:
+        msg: "Skipping pre-pull: k3s is not installed/running on this host (k3s_unit=none)."
+      when: k3s_unit == "none"
+
+    - name: Pre-pull images via containerd
+      ansible.builtin.shell: |
+        set -euo pipefail
+        k3s ctr --debug images pull --platform "{{ IMAGE_PLATFORM }}" "{{ item }}"
+      args:
+        executable: /bin/bash
+      register: pull_result
+      retries: 3
+      delay: 10
+      until: pull_result.rc == 0
+      loop: "{{ PREPULL_IMAGES }}"
+      when: k3s_unit != "none"
+
+    - name: Verify images present locally
+      ansible.builtin.shell: |
+        k3s ctr images ls | egrep 'influxdb|grafana' || true
+      args:
+        executable: /bin/bash
+      register: verify_out
+      changed_when: false
+      when: k3s_unit != "none"
+
+    - name: Print local images summary
+      ansible.builtin.debug:
+        var: verify_out.stdout
+      when: k3s_unit != "none"
+

@@ -1,0 +1,66 @@
+[
+  {
+    "source": "docker.io/meir25/jenkins:lts-jdk17",
+    "name": "jenkins",
+    "tag": "lts-jdk17",
+    "digest": null,
+    "hub_repo": "meir25/jenkins",
+    "hub_ref": "docker.io/meir25/jenkins:lts-jdk17"
+  },
+  {
+    "source": "grafana/grafana:10.4.0",
+    "name": "grafana",
+    "tag": "10.4.0",
+    "digest": null,
+    "hub_repo": "meir25/grafana",
+    "hub_ref": "docker.io/meir25/grafana:10.4.0"
+  },
+  {
+    "source": "influxdb:2.7",
+    "name": "influxdb",
+    "tag": "2.7",
+    "digest": null,
+    "hub_repo": "meir25/influxdb",
+    "hub_ref": "docker.io/meir25/influxdb:2.7"
+  },
+  {
+    "source": "rancher/klipper-lb:v0.4.13",
+    "name": "klipper-lb",
+    "tag": "v0.4.13",
+    "digest": null,
+    "hub_repo": "meir25/klipper-lb",
+    "hub_ref": "docker.io/meir25/klipper-lb:v0.4.13"
+  },
+  {
+    "source": "rancher/local-path-provisioner:v0.0.31",
+    "name": "local-path-provisioner",
+    "tag": "v0.0.31",
+    "digest": null,
+    "hub_repo": "meir25/local-path-provisioner",
+    "hub_ref": "docker.io/meir25/local-path-provisioner:v0.0.31"
+  },
+  {
+    "source": "rancher/mirrored-coredns-coredns:1.12.3",
+    "name": "mirrored-coredns-coredns",
+    "tag": "1.12.3",
+    "digest": null,
+    "hub_repo": "meir25/mirrored-coredns-coredns",
+    "hub_ref": "docker.io/meir25/mirrored-coredns-coredns:1.12.3"
+  },
+  {
+    "source": "rancher/mirrored-library-traefik:3.3.6",
+    "name": "mirrored-library-traefik",
+    "tag": "3.3.6",
+    "digest": null,
+    "hub_repo": "meir25/mirrored-library-traefik",
+    "hub_ref": "docker.io/meir25/mirrored-library-traefik:3.3.6"
+  },
+  {
+    "source": "rancher/mirrored-metrics-server:v0.8.0",
+    "name": "mirrored-metrics-server",
+    "tag": "v0.8.0",
+    "digest": null,
+    "hub_repo": "meir25/mirrored-metrics-server",
+    "hub_ref": "docker.io/meir25/mirrored-metrics-server:v0.8.0"
+  }
+]

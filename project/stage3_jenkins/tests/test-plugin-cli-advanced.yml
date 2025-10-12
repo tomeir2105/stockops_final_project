@@ -1,0 +1,90 @@
+---
+# Test Jenkins plugin CLI and REST APIs — no installs.
+
+- name: Test Jenkins plugin capabilities
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"   # expects: JENKINS_API_PORT, JENKINS_ADMIN_USER, JENKINS_ADMIN_PASS
+
+  vars:
+    kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
+    test_plugins: "{{ (JENKINS_PLUGINS | default(['kubernetes'])) | join(' ') }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    - name: Pick kubectl or 'k3s kubectl'
+      shell: "command -v kubectl >/dev/null 2>&1 && echo kubectl || echo 'k3s kubectl'"
+      args: { executable: /bin/bash }
+      register: kubectl_cmd
+      changed_when: false
+
+    - name: Find Jenkins pod and namespace
+      shell: >
+        {{ kubectl_cmd.stdout }} get pods -A -l app=jenkins
+        -o jsonpath='{.items[0].metadata.namespace} {.items[0].metadata.name}'
+      args: { executable: /bin/bash }
+      register: pod_info
+      changed_when: false
+      failed_when: pod_info.stdout | trim == ""
+
+    - name: Set facts
+      set_fact:
+        jns:  "{{ (pod_info.stdout | trim).split(' ')[0] }}"
+        jpod: "{{ (pod_info.stdout | trim).split(' ')[1] }}"
+
+    # --- Test 1: jenkins-plugin-cli version ---
+    - name: Run jenkins-plugin-cli --version with JAVA on PATH
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}"
+        exec -i "{{ jpod }}" -- bash -lc 'PATH=/opt/java/openjdk/bin:$PATH jenkins-plugin-cli --version'
+      args: { executable: /bin/bash }
+      register: plugin_cli_ver
+      changed_when: false
+
+    # --- Test 2: List installed plugins via REST API (no jq in pod) ---
+    - name: Fetch installed plugins JSON (single-line curl)
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'curl -sS -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} "http://localhost:{{ JENKINS_API_PORT }}/pluginManager/api/json?depth=1"'
+      args: { executable: /bin/bash }
+      register: plugins_json
+      changed_when: false
+      failed_when: plugins_json.rc != 0 or (plugins_json.stdout | trim) == ""
+
+    - name: Parse plugins JSON in Ansible
+      set_fact:
+        _plugins_obj: "{{ plugins_json.stdout | from_json }}"
+        installed_plugins: "{{ _plugins_obj.plugins | default([]) }}"
+
+    - name: Print installed plugins (name \t version)
+      debug:
+        msg: "{{ item.shortName }}\t{{ item.version }}"
+      loop: "{{ installed_plugins }}"
+
+    # --- Test 3: Dry-run dependency resolution (download then delete) ---
+    - name: Resolve plugins to temp directory (no install)
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'set -e; TMP="/tmp/plugin-cli-test-$$"; mkdir -p "$TMP";
+         PATH=/opt/java/openjdk/bin:$PATH jenkins-plugin-cli --plugins "{{ test_plugins }}" --plugin-download-directory "$TMP" --verbose;
+         echo "Downloaded: $(ls -1 "$TMP"/*.jpi "$TMP"/*.hpi 2>/dev/null | wc -l)";
+         ls -1 "$TMP"/*.jpi "$TMP"/*.hpi 2>/dev/null | head -10 || true;
+         rm -rf "$TMP"'
+      args: { executable: /bin/bash }
+      register: resolve_out
+      changed_when: true
+
+    - name: Print summary
+      debug:
+        msg:
+          - "Namespace: {{ jns }}"
+          - "Pod: {{ jpod }}"
+          - "jenkins-plugin-cli version: {{ plugin_cli_ver.stdout | trim }}"
+          - "Dry-run output (first lines):"
+          - "{{ (resolve_out.stdout_lines | default([]))[:20] }}"
+

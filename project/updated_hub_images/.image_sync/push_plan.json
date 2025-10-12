@@ -1,0 +1,32 @@
+[
+    {
+        "action": "nothing",
+        "dest": "docker://docker.io/meir25/jenkins:lts-jdk17",
+        "dst_digest": "sha256:7dc1d130f84637f905f19f98e2f2102360429c3e95f121869609cdad7d45e297",
+        "name": "jenkins",
+        "source": "docker.io/meir25/jenkins:lts-jdk17",
+        "src_digest": "sha256:7dc1d130f84637f905f19f98e2f2102360429c3e95f121869609cdad7d45e297",
+        "status": "EXISTS",
+        "tag": "lts-jdk17"
+    },
+    {
+        "action": "nothing",
+        "dest": "docker://docker.io/meir25/grafana:10.4.0",
+        "dst_digest": "sha256:f9811e4e687ffecf1a43adb9b64096c50bc0d7a782f8608530f478b6542de7d5",
+        "name": "grafana",
+        "source": "grafana/grafana:10.4.0",
+        "src_digest": "sha256:f9811e4e687ffecf1a43adb9b64096c50bc0d7a782f8608530f478b6542de7d5",
+        "status": "EXISTS",
+        "tag": "10.4.0"
+    },
+    {
+        "action": "nothing",
+        "dest": "docker://docker.io/meir25/influxdb:2.7",
+        "dst_digest": "sha256:674911452ada77ca762662d50dd0594c8823312f59b376500623a4f82c44f9be",
+        "name": "influxdb",
+        "source": "influxdb:2.7",
+        "src_digest": "sha256:674911452ada77ca762662d50dd0594c8823312f59b376500623a4f82c44f9be",
+        "status": "EXISTS",
+        "tag": "2.7"
+    }
+]

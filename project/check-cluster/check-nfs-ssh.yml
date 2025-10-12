@@ -1,0 +1,299 @@
+---
+###############################################################################
+# Play 0: Load variables & quick sanity
+###############################################################################
+- name: Load shared vars (no changes)
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  tasks:
+    - name: Assert core variables exist
+      assert:
+        that:
+          - NFS_MOUNTPOINT is defined
+          - NFS_ALLOWED_CIDR is defined
+          - NFS_SERVER_IP is defined
+          - NFS_MOUNTPOINT is defined
+        fail_msg: "Missing required vars (NFS_MOUNTPOINT, NFS_ALLOWED_CIDR, NFS_SERVER_IP, NFS_MOUNTPOINT)."
+
+###############################################################################
+# Play 1: Verify controller (router) SSH materials & known_hosts
+###############################################################################
+- name: Verify controller SSH & known_hosts on router
+  hosts: k3srouter_host
+  become: false
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    _home: "{{ ansible_user_dir | default(lookup('env','HOME')) }}"
+    ssh_dir: "{{ _home }}/.ssh"
+    ssh_key_name: "{{ SSH_KEY_NAME | default('ansible_ed25519') }}"
+    key_path: "{{ ssh_dir }}/{{ ssh_key_name }}"
+    known_hosts_path: "{{ ssh_dir }}/known_hosts"
+    names: "{{ groups.k3s_server + groups.k3s_workers }}"
+    ips_from_group: "{{ groups.ssh_scan_hosts }}"
+  tasks:
+    - name: Verify keypair exists
+      stat:
+        path: "{{ item }}"
+      register: kstat
+      loop:
+        - "{{ key_path }}"
+        - "{{ key_path }}.pub"
+      changed_when: false
+
+    - name: Assert controller key files present
+      assert:
+        that:
+          - kstat.results[0].stat.exists
+          - kstat.results[1].stat.exists
+        fail_msg: "Controller keypair {{ key_path }}(.pub) is missing."
+
+    - name: Verify known_hosts exists
+      stat:
+        path: "{{ known_hosts_path }}"
+      register: kh
+      changed_when: false
+
+    - name: Assert known_hosts present
+      assert:
+        that: kh.stat.exists
+        fail_msg: "known_hosts not found at {{ known_hosts_path }}."
+
+    - name: Assert each node has ansible_host defined
+      assert:
+        that:
+          - hostvars[item].ansible_host is defined
+          - hostvars[item].ansible_host | length > 0
+        fail_msg: "Host '{{ item }}' is missing ansible_host in inventory."
+      loop: "{{ names }}"
+
+    # Pass if either the hostname OR its IP exists in known_hosts
+    - name: Verify known_hosts has entry for each node (hostname OR IP)
+      command:
+        cmd: >
+          bash -lc "ssh-keygen -F {{ item }} -f {{ known_hosts_path }}
+          || ssh-keygen -F {{ hostvars[item].ansible_host }} -f {{ known_hosts_path }}"
+      register: kh_find_either
+      changed_when: false
+      failed_when: kh_find_either.rc != 0
+      loop: "{{ names }}"
+
+    # Also verify the explicit ssh_scan_hosts IPs (includes the router IP)
+    - name: Verify known_hosts has entries for ssh_scan_hosts IPs
+      command:
+        argv:
+          - ssh-keygen
+          - -F
+          - "{{ item }}"
+          - -f
+          - "{{ known_hosts_path }}"
+      register: kh_find_group_ip
+      changed_when: false
+      failed_when: kh_find_group_ip.rc != 0
+      loop: "{{ ips_from_group }}"
+
+###############################################################################
+# Play 2: Verify remote authorized_keys contains controller public key
+###############################################################################
+- name: Verify controller pubkey installed on nodes
+  hosts: k3s_server:k3s_workers
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    target_user: "{{ TARGET_USER | default(ansible_user | default('user')) }}"
+    controller_pubkey: "{{ lookup('file', '~/.ssh/' ~ (SSH_KEY_NAME | default('ansible_ed25519')) ~ '.pub') }}"
+  tasks:
+    - name: Get remote home dir of target user
+      command: "getent passwd {{ target_user }}"
+      register: pwd_entry
+      changed_when: false
+
+    - name: Resolve remote home path
+      set_fact:
+        remote_home: "{{ (pwd_entry.stdout.split(':'))[5] }}"
+
+    - name: Read authorized_keys (no change)
+      slurp:
+        path: "{{ remote_home }}/.ssh/authorized_keys"
+      register: ak
+      failed_when: ak is failed
+      changed_when: false
+
+    - name: Assert controller pubkey present
+      assert:
+        that:
+          - (ak.content | b64decode).find(controller_pubkey) != -1
+        fail_msg: "Controller pubkey not present in {{ remote_home }}/.ssh/authorized_keys on {{ inventory_hostname }}."
+
+###############################################################################
+# Play 3: Verify /etc/hosts managed block on router and nodes
+###############################################################################
+- name: Verify /etc/hosts entries for cluster
+  hosts: k3srouter_host:k3s_server:k3s_workers
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Build combined host list from inventory
+      set_fact:
+        _all_nodes: >-
+          {{
+            (groups.k3srouter_host + groups.k3s_server + groups.k3s_workers)
+            | unique
+          }}
+
+    - name: Verify each host defines ansible_host and host_label
+      assert:
+        that:
+          - hostvars[item].ansible_host is defined
+          - hostvars[item].ansible_host | length > 0
+          - hostvars[item].host_label is defined
+          - hostvars[item].host_label | length > 0
+        fail_msg: "Host '{{ item }}' missing ansible_host or host_label in inventory."
+      loop: "{{ _all_nodes }}"
+
+    - name: Read /etc/hosts
+      slurp:
+        path: /etc/hosts
+      register: hosts_file
+      changed_when: false
+
+    - name: Assert each expected line exists in /etc/hosts
+      vars:
+        hf: "{{ hosts_file.content | b64decode }}"
+      assert:
+        that:
+          # (?im) = case-insensitive + multiline
+          - hf is search(
+              '(?im)^'
+              ~ (hostvars[item].ansible_host | regex_escape)
+              ~ '\\s+.*\\b'
+              ~ hostvars[item].host_label
+              ~ '\\b'
+            )
+        fail_msg: "Missing /etc/hosts line: {{ hostvars[item].ansible_host }} {{ hostvars[item].host_label }} on {{ inventory_hostname }}."
+      loop: "{{ _all_nodes }}"
+
+###############################################################################
+# Play 4: Verify NFS exports and app directories (router only)
+###############################################################################
+- name: Verify NFS exports on router
+  hosts: k3srouter_host
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  pre_tasks:
+    - name: Assert APP_DIRS is defined and non-empty
+      assert:
+        that:
+          - APP_DIRS is defined
+          - APP_DIRS | length > 0
+        fail_msg: "APP_DIRS is missing or empty in vars.yml"
+
+  tasks:
+    - name: Run exportfs -v
+      command: exportfs -v
+      register: exports_v
+      changed_when: false
+
+    - name: Assert base export contains root_squash for allowed CIDR
+      assert:
+        that:
+          - exports_v.stdout is search(NFS_MOUNTPOINT ~ '\\s+' ~ NFS_ALLOWED_CIDR ~ '\\(.*root_squash.*\\)', multiline=True)
+        fail_msg: "Expected export '{{ NFS_MOUNTPOINT }} {{ NFS_ALLOWED_CIDR }}(...root_squash...)' not found."
+
+    - name: Assert no fsid=0 or <world> export present
+      assert:
+        that:
+          - exports_v.stdout is not search('fsid=0')
+          - exports_v.stdout is not search(' /\\s+<world>')
+        fail_msg: "Unexpected fsid=0 or <world> export present. Clean up router exports."
+
+    # Validate exactly what you declared in APP_DIRS (path/owner/group/mode)
+    - name: Stat app directories (per APP_DIRS)
+      stat:
+        path: "{{ item.path }}"
+      register: st
+      loop: "{{ APP_DIRS }}"
+      changed_when: false
+
+    - name: Assert app dirs match expected state (exists, dir, mode, uid, gid)
+      vars:
+        # actual (from stat)
+        act_path: "{{ item.stat.path }}"
+        act_mode_oct: "{{ item.stat.mode | int(base=8) }}"
+        act_uid: "{{ item.stat.uid }}"
+        act_gid: "{{ item.stat.gid }}"
+        # expected (from original loop item)
+        exp_path: "{{ item.item.path }}"
+        exp_mode_oct: "{{ (item.item.mode | string) | int(base=8) }}"
+        exp_uid: "{{ item.item.owner | int }}"
+        exp_gid: "{{ item.item.group | int }}"
+      assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir
+          - act_path == exp_path
+          - act_mode_oct == exp_mode_oct
+          - act_uid == exp_uid
+          - act_gid == exp_gid
+        fail_msg: >-
+          App dir invalid: {{ act_path }}
+          (exists={{ item.stat.exists }}, isdir={{ item.stat.isdir }},
+          mode={{ item.stat.mode }} expected={{ item.item.mode }},
+          uid={{ act_uid }} expected={{ exp_uid }},
+          gid={{ act_gid }} expected={{ exp_gid }}).
+      loop: "{{ st.results }}"
+      loop_control:
+        label: "{{ item.stat.path }}"
+
+
+###############################################################################
+# Play 5: Verify client NFS mounts and fstab entries (nodes only)
+###############################################################################
+- name: Verify client-side NFS mounts
+  hosts: k3s_server:k3s_workers
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  tasks:
+    - name: Check current mount via findmnt
+      command: "findmnt -no SOURCE,FSTYPE,OPTIONS {{ NFS_MOUNTPOINT }}"
+      register: mnt
+      changed_when: false
+
+    - name: Verify mount is nfs4 or autofs
+      assert:
+        that:
+          - "'nfs4' in mnt.stdout or 'autofs' in mnt.stdout"
+        fail_msg: "Mount is neither NFSv4 nor autofs — got: {{ mnt.stdout | default('NONE') }}"
+
+    - name: Verify /etc/fstab contains correct line
+      command: "grep -E '^[[:space:]]*{{ NFS_SERVER_IP }}:{{ NFS_MOUNTPOINT }}[[:space:]]+{{ NFS_MOUNTPOINT }}[[:space:]]+nfs4[[:space:]]+' /etc/fstab"
+      register: fstab_grep
+      changed_when: false
+      failed_when: fstab_grep.rc != 0
+
+###############################################################################
+# Play 6: Summary (local)
+###############################################################################
+- name: Summary
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  tasks:
+    - debug:
+        msg:
+          - "All verifications passed."
+          - "SSH: controller keypair present; nodes contain controller pubkey."
+          - "/etc/hosts: managed entries present on router and nodes."
+          - "NFS: router exports OK; app dirs OK; nodes mounted {{ NFS_MOUNTPOINT }} via NFSv4 with vers=4.x and fstab entry present."
+

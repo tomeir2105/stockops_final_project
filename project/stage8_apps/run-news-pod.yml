@@ -1,0 +1,242 @@
+---
+# Play 1: Normalize registries (public pull, no DockerHub auth)
+- name: Normalize registries on all k3s nodes (remove docker.io auth)
+  hosts: k3s_server,k3s_workers
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  tasks:
+    - name: Write minimal registries.yaml with no auth
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/registries.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          mirrors:
+            docker.io:
+              endpoint:
+                - https://registry-1.docker.io
+          configs: {}
+      notify: restart k3s
+
+  handlers:
+    - name: restart k3s server
+      listen: "restart k3s"
+      ansible.builtin.service:
+        name: k3s
+        state: restarted
+      when: "'k3s_server' in group_names"
+
+    - name: restart k3s agent
+      listen: "restart k3s"
+      ansible.builtin.service:
+        name: k3s-agent
+        state: restarted
+      when: "'k3s_workers' in group_names"
+
+
+# Play 2: Deploy news as a Deployment (no Docker build)
+- name: Deploy news as a Deployment (no Docker build)
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG }}"
+
+  pre_tasks:
+    - name: Ensure python3 + k8s client libs are present
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-kubernetes
+        state: present
+        update_cache: yes
+
+    - name: Ensure NFS directory for news exists on NFS server
+      ansible.builtin.file:
+        path: "{{ NEWS_NFS_PATH }}"
+        state: directory
+        owner: "{{ (APP_DIRS | selectattr('path', 'equalto', NEWS_NFS_PATH) | first).owner }}"
+        group: "{{ (APP_DIRS | selectattr('path', 'equalto', NEWS_NFS_PATH) | first).group }}"
+        mode:  "{{ (APP_DIRS | selectattr('path', 'equalto', NEWS_NFS_PATH) | first).mode }}"
+      delegate_to: "{{ groups['nfs_server'][0] }}"
+      become: yes
+
+    - name: Cache news-dir spec from APP_DIRS
+      ansible.builtin.set_fact:
+        news_dir_spec: "{{ (APP_DIRS | selectattr('path','equalto', NEWS_NFS_PATH) | first) }}"
+
+    - name: Copy app files to NFS (news)
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ NEWS_NFS_PATH }}/{{ item.dest }}"
+        owner: "{{ news_dir_spec.owner }}"
+        group: "{{ news_dir_spec.group }}"
+        mode: "0644"
+      loop:
+        - { src: "{{ playbook_dir }}/../apps/news/app.py",           dest: "app.py" }
+        - { src: "{{ playbook_dir }}/../apps/news/requirements.txt", dest: "requirements.txt" }
+      delegate_to: "{{ groups['nfs_server'][0] }}"
+      become: yes
+
+  tasks:
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ NAMESPACE }}"
+
+    - name: Create NFS PV for news
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: news-pv
+          spec:
+            capacity:
+              storage: "{{ NEWS_STORAGE }}"
+            accessModes: [ "ReadWriteMany" ]
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+            nfs:
+              server: "{{ NFS_SERVER_IP }}"
+              path: "{{ NEWS_NFS_PATH }}"
+
+    - name: Create PVC for news
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: news-pvc
+            namespace: "{{ NAMESPACE }}"
+          spec:
+            accessModes: [ "ReadWriteMany" ]
+            resources:
+              requests:
+                storage: "{{ NEWS_STORAGE }}"
+            storageClassName: ""
+            volumeName: news-pv
+
+    - name: Ensure a clean ServiceAccount without imagePullSecrets
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: public-pull
+            namespace: "{{ NAMESPACE }}"
+
+    - name: Delete old news Deployment (to reapply spec cleanly)
+      kubernetes.core.k8s:
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        name: news
+        namespace: "{{ NAMESPACE }}"
+      ignore_errors: yes
+
+    - name: Create/Update news Deployment
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: news
+            namespace: "{{ NAMESPACE }}"
+            labels: { app: news }
+          spec:
+            replicas: 1
+            strategy:
+              type: Recreate
+            selector:
+              matchLabels:
+                app: news
+            template:
+              metadata:
+                labels:
+                  app: news
+              spec:
+                securityContext:
+                  runAsUser: "{{ news_dir_spec.owner | int }}"
+                  runAsGroup: "{{ news_dir_spec.group | int }}"
+                  fsGroup: "{{ news_dir_spec.group | int }}"
+                  fsGroupChangePolicy: "OnRootMismatch"
+                serviceAccountName: public-pull
+                restartPolicy: Always
+                containers:
+                  - name: news
+                    image: "python:3.12-slim"
+                    imagePullPolicy: IfNotPresent
+                    env:
+                      - name: HOME
+                        value: /app
+                      - name: INFLUX_URL
+                        value: "{{ INFLUXDB_URL }}"
+                      - name: INFLUX_TOKEN
+                        value: "{{ INFLUXDB_ADMIN_TOKEN }}"
+                      - name: INFLUX_ORG
+                        value: "{{ INFLUXDB_ORG }}"
+                      - name: INFLUX_BUCKET
+                        value: "{{ INFLUXDB_BUCKET }}"
+                      - name: NEWS_POLL_SECONDS
+                        value: "{{ NEWS_POLL_SECONDS }}"
+                      - name: NEWS_TICKERS
+                        value: "AAPL,MSFT,GOOGL"
+                      - name: TICKERS
+                        value: "$(NEWS_TICKERS)"        # expand from NEWS_TICKERS at runtime
+                      - name: NEWS_FILTER_REQUIRE_TICKER
+                        value: "false"                  # allow company-name matches
+                      - name: NEWS_BACKFILL_ON_START
+                        value: "true"                   # backfill on every start
+                      - name: NEWS_BACKFILL_DAYS
+                        value: "7"                      # backfill window
+                    command: ["/bin/sh", "-lc"]
+                    args:
+                      - >
+                        if [ ! -d /app/.venv ]; then
+                          python -m venv /app/.venv;
+                        fi &&
+                        /app/.venv/bin/pip install --no-cache-dir -r /app/requirements.txt &&
+                        exec /app/.venv/bin/python -u /app/app.py
+                    resources:
+                      requests:
+                        cpu: "{{ NEWS_CPU_REQUEST }}"
+                        memory: "{{ NEWS_MEM_REQUEST }}"
+                      limits:
+                        cpu: "{{ NEWS_CPU_LIMIT }}"
+                        memory: "{{ NEWS_MEM_LIMIT }}"
+                    volumeMounts:
+                      - name: data
+                        mountPath: /app
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: news-pvc
+
+    - name: Verify /app directory permissions and contents in running news pod
+      ansible.builtin.shell: |
+        set -e
+        POD=$(kubectl -n {{ NAMESPACE }} get pod -l app=news -o jsonpath='{.items[0].metadata.name}')
+        echo "Checking pod: $POD"
+        kubectl -n {{ NAMESPACE }} exec "$POD" -- sh -lc 'id && ls -ld /app && ls -l /app || true'
+      register: news_ls_output
+      changed_when: false
+
+    - name: Print /app permissions from news pod
+      ansible.builtin.debug:
+        msg: "{{ news_ls_output.stdout_lines }}"
+

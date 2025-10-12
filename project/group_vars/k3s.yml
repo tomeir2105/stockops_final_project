@@ -1,0 +1,6 @@
+---
+ansible_user: user
+ansible_ssh_private_key_file: /home/user/.ssh/ansible_ed25519
+ansible_python_interpreter: /usr/bin/python3
+# optional: avoid hostkey prompts on first contact
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no"

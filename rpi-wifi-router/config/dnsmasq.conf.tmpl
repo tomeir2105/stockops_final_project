@@ -1,0 +1,16 @@
+# Bind only to WLAN LAN interface; use bind-dynamic so startup tolerates timing.
+interface=${LAN_IFACE}
+bind-dynamic
+# No listen-address line needed; bind-dynamic handles address presence.
+except-interface=lo
+except-interface=${WAN_IFACE}
+
+# Our LAN
+dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},${DHCP_LEASE}
+dhcp-option=option:router,${LAN_IP}
+dhcp-option=option:dns-server,${LAN_IP}
+domain-needed
+bogus-priv
+log-queries
+log-dhcp
+

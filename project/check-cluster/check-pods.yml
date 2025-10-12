@@ -1,0 +1,64 @@
+---
+- name: Verify all pods and components are healthy
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+  vars:
+    kubeconfig_path: /etc/rancher/k3s/k3s.yaml
+    required_strings:
+      - coredns
+      - provisioner
+      - traefik
+      - grafana
+      - influxdb
+      - jenkins
+
+  tasks:
+    - name: Get all pods
+      ansible.builtin.shell: |
+        set -euo pipefail
+        K="kubectl"; command -v kubectl >/dev/null 2>&1 || K="k3s kubectl"
+        $K --kubeconfig {{ kubeconfig_path }} get pods -A --no-headers
+      args:
+        executable: /bin/bash
+      register: pods
+      changed_when: false
+
+    - name: Verify all pods are Running (ignore Terminating/Deleted)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        K="kubectl"; command -v kubectl >/dev/null 2>&1 || K="k3s kubectl"
+        # List pods that are NOT Running/Succeeded AND are NOT being deleted.
+        $K --kubeconfig {{ kubeconfig_path }} get pods -A \
+          -o jsonpath='{range .items[?(@.metadata.deletionTimestamp==null && @.status.phase!="Running" && @.status.phase!="Succeeded")]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}'
+      args:
+        executable: /bin/bash
+      register: not_running
+      changed_when: false
+      failed_when: not_running.stdout | trim | length > 0
+
+
+
+    - name: Verify required components exist
+      ansible.builtin.shell: |
+        missing=0
+        for s in {{ required_strings | join(' ') }}; do
+          if ! echo "{{ pods.stdout }}" | grep -q "$s"; then
+            echo "Missing component: $s"
+            missing=1
+          fi
+        done
+        exit $missing
+      args:
+        executable: /bin/bash
+      register: missing_check
+      changed_when: false
+      failed_when: missing_check.rc != 0
+
+    - name: All pods are Running and all components are present
+      ansible.builtin.debug:
+        msg: "All pods are Running and all key components (coredns, provisioner, traefik×4, grafana, influxdb, jenkins) are present."
+      when:
+        - not_running.stdout | trim | length == 0
+        - missing_check.rc == 0
+

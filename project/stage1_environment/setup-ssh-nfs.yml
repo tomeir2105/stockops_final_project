@@ -1,0 +1,284 @@
+---
+# setup-ssh-nfs.yml — Stage 0/1/2 with resilient ssh-keyscan (no loop-on-block) + clean NFS setup
+
+###############################################################################
+# STAGE 0 — Preflight on controller (keys, known_hosts)
+###############################################################################
+- name: Stage 0 — SSH | Prepare controller (keys, known_hosts)
+  hosts: k3srouter_host
+  gather_facts: false
+  become: false
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  pre_tasks:
+    - name: Assert required SSH vars exist
+      assert:
+        that:
+          - CONTROLLER_KEY_PATH is defined
+          - CONTROLLER_KEY_PATH | length > 0
+          - CONTROLLER_KNOWN_HOSTS_PATH is defined
+          - CONTROLLER_KNOWN_HOSTS_PATH | length > 0
+        fail_msg: "Missing one or more required SSH vars (CONTROLLER_KEY_PATH, CONTROLLER_KNOWN_HOSTS_PATH)."
+
+    - name: Derive controller ssh dir
+      set_fact:
+        CONTROLLER_SSH_DIR: "{{ CONTROLLER_KEY_PATH | regex_replace('/[^/]+$','') }}"
+
+  tasks:
+    - name: Ensure openssh-client (ssh-keyscan) is installed on controller
+      become: true
+      package:
+        name: openssh-client
+        state: present
+
+    - name: Ensure controller .ssh directory exists
+      file:
+        path: "{{ CONTROLLER_SSH_DIR }}"
+        state: directory
+        mode: "0700"
+
+    - name: Ensure known_hosts file exists with strict perms
+      file:
+        path: "{{ CONTROLLER_KNOWN_HOSTS_PATH }}"
+        state: touch
+        mode: "0600"
+
+    - name: Create ed25519 keypair if missing
+      community.crypto.openssh_keypair:
+        path: "{{ CONTROLLER_KEY_PATH }}"
+        type: ed25519
+        state: present
+        mode: "0600"
+
+    # ---- Resilient key scan: try all common types in one call; never fail the play ----
+    - name: Build list of hosts to scan
+      set_fact:
+        _ssh_scan_hosts: "{{ groups['ssh_scan_hosts'] | default([]) }}"
+
+    - name: ssh-keyscan for all supported types (hashed hostnames)
+      command: "ssh-keyscan -T 5 -H -t ed25519,ecdsa,rsa {{ item }}"
+      register: _scan_results
+      changed_when: false
+      failed_when: false
+      loop: "{{ _ssh_scan_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Add scanned host keys to known_hosts (idempotent)
+      when: (item.stdout | default('') | trim) != ''
+      known_hosts:
+        path: "{{ CONTROLLER_KNOWN_HOSTS_PATH }}"
+        name: "{{ item.item }}"
+        key: "{{ item.stdout }}"
+        state: present
+      loop: "{{ _scan_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Report hosts with no discoverable host key
+      when: (item.stdout | default('') | trim) == ''
+      debug:
+        msg: "Skipped adding known_hosts for {{ item.item }} (no key found via ssh-keyscan)."
+      loop: "{{ _scan_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+###############################################################################
+# STAGE 1 — Install controller key on nodes + /etc/hosts block
+###############################################################################
+- name: Stage 1 — SSH | Install controller public key on nodes
+  hosts: k3s_server:k3s_workers
+  gather_facts: false
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  pre_tasks:
+    - name: Assert TARGET_USER exists
+      assert:
+        that:
+          - TARGET_USER is defined
+          - TARGET_USER | length > 0
+        fail_msg: "Missing TARGET_USER."
+
+    - name: Ensure controller pubkey exists and readable (run on controller)
+      stat:
+        path: "{{ CONTROLLER_KEY_PATH }}.pub"
+      register: _pub
+      delegate_to: "{{ groups['k3srouter_host'][0] }}"
+      run_once: true
+
+    - name: Fail if pubkey missing
+      fail:
+        msg: "Controller public key {{ CONTROLLER_KEY_PATH }}.pub not found."
+      when: not _pub.stat.exists
+      run_once: true
+
+    - name: Slurp controller public key (run on controller)
+      slurp:
+        src: "{{ CONTROLLER_KEY_PATH }}.pub"
+      register: _pubkey
+      delegate_to: "{{ groups['k3srouter_host'][0] }}"
+      run_once: true
+
+  tasks:
+    - name: Authorize controller public key (idempotent, no duplicates)
+      ansible.posix.authorized_key:
+        user: "{{ TARGET_USER }}"
+        key: "{{ _pubkey.content | b64decode }}"
+        state: present
+        manage_dir: true
+
+- name: Stage 1 — SSH | Write unified /etc/hosts block (router + servers + workers)
+  hosts: k3srouter_host:k3s_server:k3s_workers
+  gather_facts: false
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  pre_tasks:
+    - name: Assert HOSTS_GROUPS is defined and non-empty
+      assert:
+        that:
+          - HOSTS_GROUPS is defined
+          - HOSTS_GROUPS | length > 0
+        fail_msg: "Missing HOSTS_GROUPS (list of group names for /etc/hosts)."
+
+    - name: Assert all listed groups exist in inventory
+      assert:
+        that: "{{ item in groups }}"
+        fail_msg: "Group '{{ item }}' not found in inventory."
+      loop: "{{ HOSTS_GROUPS }}"
+
+    - name: Build ordered unique host list from HOSTS_GROUPS
+      set_fact:
+        _all_nodes: "{{ (HOSTS_GROUPS | map('extract', groups) | list) | flatten | unique }}"
+
+    - name: Assert each host has ansible_host defined
+      assert:
+        that:
+          - hostvars[item].ansible_host is defined
+          - hostvars[item].ansible_host | length > 0
+        fail_msg: "Host '{{ item }}' is missing ansible_host."
+      loop: "{{ _all_nodes }}"
+      run_once: true
+
+  tasks:
+    - name: Write managed /etc/hosts block exactly once
+      blockinfile:
+        path: /etc/hosts
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED BLOCK (k3s cluster hosts)"
+        block: |
+          {% for h in _all_nodes %}
+          {{ hostvars[h].ansible_host }} {{ h }}
+          {% endfor %}
+
+###############################################################################
+# STAGE 2 — NFS server: folder-only export + verify
+###############################################################################
+- name: Stage 2 — NFS | Configure NFS server (folder-only)
+  hosts: k3srouter_host
+  gather_facts: true
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    NFS_MOUNTPOINT: "{{ lookup('vars', 'NFS_MOUNTPOINT') }}"
+    NFS_EXPORTS_FILE: "{{ lookup('vars', 'NFS_EXPORTS_FILE') }}"
+    NFS_ALLOWED_CIDR: "{{ lookup('vars', 'NFS_ALLOWED_CIDR') }}"
+    NFS_EXPORT_OPTS: "{{ lookup('vars', 'NFS_EXPORT_OPTS') }}"
+
+  pre_tasks:
+    - name: Assert minimal NFS vars exist
+      assert:
+        that:
+          - NFS_MOUNTPOINT is defined and NFS_MOUNTPOINT | length > 0
+          - NFS_EXPORTS_FILE is defined and NFS_EXPORTS_FILE | length > 0
+          - NFS_ALLOWED_CIDR is defined and NFS_ALLOWED_CIDR | length > 0
+          - NFS_EXPORT_OPTS is defined and NFS_EXPORT_OPTS | length > 0
+        fail_msg: "Missing one or more required NFS vars (NFS_MOUNTPOINT, NFS_EXPORTS_FILE, NFS_ALLOWED_CIDR, NFS_EXPORT_OPTS)."
+
+  tasks:
+    - name: Remove any fstab entry that mounts /mnt/k3s_storage from a device/label/uuid
+      lineinfile:
+        path: /etc/fstab
+        state: absent
+        regexp: '^[#\s]*(LABEL=|UUID=|/dev/[^ \t]+)\s+/mnt/k3s_storage\b'
+      notify: Reload systemd
+
+    - name: Stop/disable generated mount unit if present
+      command: systemctl disable --now mnt-k3s_storage.mount
+      register: _mnt_disable
+      failed_when: false
+      changed_when: "'Removed' in _mnt_disable.stdout or 'disabled' in _mnt_disable.stdout"
+
+    - name: Install NFS packages
+      package:
+        name:
+          - nfs-kernel-server
+          - nfs-common
+          - rpcbind
+        state: present
+
+    - name: Ensure base path exists (folder we will export)
+      file:
+        path: "{{ NFS_MOUNTPOINT }}"
+        state: directory
+        owner: "root"
+        group: "root"
+        mode: "0775"
+
+    - name: Create app directories
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop: "{{ APP_DIRS | default([]) }}"
+
+    - name: Write a single authoritative exports.d file
+      copy:
+        dest: "{{ NFS_EXPORTS_FILE }}"
+        mode: "0644"
+        content: |
+          # Managed by Ansible — DO NOT EDIT
+          {{ NFS_MOUNTPOINT }} {{ NFS_ALLOWED_CIDR }}({{ NFS_EXPORT_OPTS }})
+
+    - name: Reload exports
+      command: exportfs -ra
+
+    - name: Enable/start rpcbind
+      service:
+        name: rpcbind
+        state: started
+        enabled: true
+
+    - name: Enable/start NFS
+      service:
+        name: nfs-kernel-server
+        state: started
+        enabled: true
+
+    - name: VERIFY | base export exists
+      command: exportfs -v
+      register: _exports
+      changed_when: false
+
+    - name: VERIFY | assert base export is present
+      assert:
+        that:
+          - NFS_MOUNTPOINT in _exports.stdout
+          - (NFS_ALLOWED_CIDR.split('/'))[0] in _exports.stdout
+        fail_msg: |
+          Expected export for {{ NFS_MOUNTPOINT }} not found.
+          Got:
+          {{ _exports.stdout }}
+
+  handlers:
+    - name: Reload systemd
+      command: systemctl daemon-reload
+

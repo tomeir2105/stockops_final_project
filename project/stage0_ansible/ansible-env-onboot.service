@@ -1,0 +1,13 @@
+[Unit]
+Description=One-time export of ANSIBLE_CONFIG at boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ansible-env-onboot.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+

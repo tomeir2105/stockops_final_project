@@ -1,0 +1,89 @@
+---
+# Verifies jenkins-plugin-cli presence (version) and triggers a safe restart via REST.
+# No plugin installs. No CLI jar usage.
+
+- name: Test jenkins-plugin-cli and safe restart (REST)
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"   # needs: JENKINS_API_PORT, JENKINS_ADMIN_USER, JENKINS_ADMIN_PASS
+
+  vars:
+    kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    - name: Pick kubectl or 'k3s kubectl'
+      shell: "command -v kubectl >/dev/null 2>&1 && echo kubectl || echo 'k3s kubectl'"
+      args: { executable: /bin/bash }
+      register: kubectl_cmd
+      changed_when: false
+
+    - name: Find Jenkins pod and namespace
+      shell: >
+        {{ kubectl_cmd.stdout }} get pods -A -l app=jenkins
+        -o jsonpath='{.items[0].metadata.namespace} {.items[0].metadata.name}'
+      args: { executable: /bin/bash }
+      register: pod_info
+      changed_when: false
+      failed_when: pod_info.stdout | trim == ""
+
+    - name: Set facts
+      set_fact:
+        jns:  "{{ (pod_info.stdout | trim).split(' ')[0] }}"
+        jpod: "{{ (pod_info.stdout | trim).split(' ')[1] }}"
+
+    # --- Test: jenkins-plugin-cli version (no installs) ---
+    - name: Run jenkins-plugin-cli --version with JAVA on PATH
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}"
+        exec -i "{{ jpod }}" -- bash -lc
+        'PATH=/opt/java/openjdk/bin:$PATH jenkins-plugin-cli --version'
+      args: { executable: /bin/bash }
+      register: plugin_cli_ver
+      changed_when: false
+
+    # --- Safe restart via REST API (no CLI jar) ---
+    - name: Get crumb header (single line; tolerate CSRF disabled)
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'curl -s -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} "http://localhost:{{ JENKINS_API_PORT }}/crumbIssuer/api/json"
+         | sed -n "s/.*\"crumbRequestField\":\"\\([^\"]*\\)\".*\"crumb\":\"\\([^\"]*\\)\".*/\\1: \\2/p" || true'
+      args: { executable: /bin/bash }
+      register: crumb_hdr_cmd
+      changed_when: false
+
+    - name: Trigger safe restart via REST (with crumb if present)
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'if [ -n "{{ crumb_hdr_cmd.stdout | trim }}" ]; then
+           curl -s -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} -H "{{ crumb_hdr_cmd.stdout | trim }}" -X POST "http://localhost:{{ JENKINS_API_PORT }}/safeRestart";
+         else
+           curl -s -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} -X POST "http://localhost:{{ JENKINS_API_PORT }}/safeRestart";
+         fi'
+      args: { executable: /bin/bash }
+      register: restart_out
+      changed_when: true
+
+    - name: Wait for Jenkins pod to become Ready again
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}"
+        wait --for=condition=Ready pod -l app=jenkins --timeout=180s
+      args: { executable: /bin/bash }
+      register: wait_out
+      changed_when: false
+      failed_when: "'condition met' not in wait_out.stdout"
+
+    - name: Summary
+      debug:
+        msg:
+          - "Namespace: {{ jns }}"
+          - "Pod: {{ jpod }}"
+          - "jenkins-plugin-cli version: {{ plugin_cli_ver.stdout | trim }}"
+          - "Crumb header used: {{ (crumb_hdr_cmd.stdout | trim) | ternary('yes','no') }}"
+          - "Wait output: {{ wait_out.stdout | trim }}"
+

@@ -1,0 +1,128 @@
+---
+# Play 1 — Set system timezone to Israel (Asia/Jerusalem) and ensure NTP
+- name: Set all nodes to Israel time (Asia/Jerusalem) and ensure NTP
+  hosts: k3srouter_host:k3s_server:k3s_workers
+  gather_facts: false
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    # Use TIMEZONE from vars.yml if present; otherwise default
+    TZ_VALUE: "{{ TIMEZONE | default('Asia/Jerusalem') }}"
+
+  tasks:
+    - name: Ensure timezone is {{ TZ_VALUE }}
+      ansible.builtin.command: "timedatectl set-timezone {{ TZ_VALUE }}"
+
+    - name: Ensure NTP is enabled
+      ansible.builtin.command: timedatectl set-ntp true
+
+    - name: Read back current local time
+      ansible.builtin.command: date "+%Y-%m-%d %H:%M:%S %Z%z"
+      register: now_local
+      changed_when: false
+
+    - name: Read timedatectl status
+      ansible.builtin.command: timedatectl
+      register: timedatectl_out
+      changed_when: false
+      failed_when: false
+
+    - name: Summary per host
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}"
+          - "Now: {{ now_local.stdout }}"
+          - "timedatectl: {{ (timedatectl_out.stdout_lines | default([])) | select('match','^(\\s*)?(Time zone:|System clock synchronized:|NTP service:|System clock:|RTC in local TZ:)') | list }}"
+
+# Play 2 — Apply TZ to all K8s workloads; set JVM TZ for Jenkins
+- name: Set TZ env on all K8s workloads and JVM TZ for Jenkins
+  hosts: k3srouter_host
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    TZ_VALUE: "{{ TIMEZONE | default('Asia/Jerusalem') }}"
+    NAMESPACE: "{{ vars['NAMESPACE']   | default('stockops', true) }}"
+    KUBECTL_BIN: "{{ vars['KUBECTL']   | default('/usr/local/bin/kubectl', true) }}"
+    KUBECONFIG_PATH: "{{ vars['KUBECONFIG'] | default('', true) }}"
+    JENKINS_DEPLOY_NAME: "jenkins"
+    JVM_TZ_OPT: "-Duser.timezone={{ TZ_VALUE }}"
+
+  pre_tasks:
+    - name: Check kubectl path from vars.yml
+      ansible.builtin.stat:
+        path: "{{ KUBECTL_BIN }}"
+      register: kubectl_stat
+
+  tasks:
+    - name: Show chosen kubectl / namespace / jenkins deploy
+      ansible.builtin.debug:
+        msg:
+          - "kubectl: {{ KUBECTL_BIN }}"
+          - "KUBECONFIG: {{ KUBECONFIG_PATH | default('(env default)') }}"
+          - "namespace: {{ NAMESPACE }}"
+          - "jenkins deploy: {{ JENKINS_DEPLOY_NAME }}"
+          - "kubectl exists: {{ kubectl_stat.stat.exists | default(false) }}"
+          - "TZ_VALUE: {{ TZ_VALUE }}"
+
+    - block:
+        - name: Set TZ={{ TZ_VALUE }} for all Deployments
+          ansible.builtin.shell: >
+            "{{ KUBECTL_BIN }}" -n "{{ NAMESPACE }}" set env deployment --all TZ="{{ TZ_VALUE }}"
+          args: { executable: /bin/bash }
+          environment:
+            KUBECONFIG: "{{ KUBECONFIG_PATH }}"
+          register: setenv_deploy
+          changed_when: "'configured' in (setenv_deploy.stdout | default(''))"
+
+        - name: Set TZ={{ TZ_VALUE }} for all StatefulSets
+          ansible.builtin.shell: >
+            "{{ KUBECTL_BIN }}" -n "{{ NAMESPACE }}" set env statefulset --all TZ="{{ TZ_VALUE }}"
+          args: { executable: /bin/bash }
+          environment:
+            KUBECONFIG: "{{ KUBECONFIG_PATH }}"
+          register: setenv_sts
+          changed_when: "'configured' in (setenv_sts.stdout | default(''))"
+
+        - name: Set Jenkins JVM timezone (-Duser.timezone)
+          ansible.builtin.shell: >
+            "{{ KUBECTL_BIN }}" -n "{{ NAMESPACE }}" set env deploy/{{ JENKINS_DEPLOY_NAME }} JENKINS_JAVA_OPTIONS='{{ JVM_TZ_OPT }}'
+          args: { executable: /bin/bash }
+          environment:
+            KUBECONFIG: "{{ KUBECONFIG_PATH }}"
+          register: setenv_jenkins
+          changed_when: "'configured' in (setenv_jenkins.stdout | default(''))"
+
+        - name: Wait for Deployments to roll out
+          ansible.builtin.shell: >
+            set -e;
+            for d in $("{{ KUBECTL_BIN }}" -n "{{ NAMESPACE }}" get deploy -o name); do
+              "{{ KUBECTL_BIN }}" -n "{{ NAMESPACE }}" rollout status "$d" --timeout=180s;
+            done
+          args: { executable: /bin/bash }
+          environment:
+            KUBECONFIG: "{{ KUBECONFIG_PATH }}"
+          changed_when: false
+
+        - name: Wait for StatefulSets to roll out
+          ansible.builtin.shell: >
+            set -e;
+            for s in $("{{ KUBECTL_BIN }}" -n "{{ NAMESPACE }}" get statefulset -o name); do
+              "{{ KUBECTL_BIN }}" -n "{{ NAMESPACE }}" rollout status "$s" --timeout=240s;
+            done
+          args: { executable: /bin/bash }
+          environment:
+            KUBECONFIG: "{{ KUBECONFIG_PATH }}"
+          changed_when: false
+      when: kubectl_stat.stat.exists
+
+    - name: Skip note (kubectl not found at configured path)
+      ansible.builtin.debug:
+        msg: >
+          Skipping K8s TZ updates because kubectl was not found at {{ KUBECTL_BIN }}.
+          You can run manually:
+          KUBECONFIG={{ KUBECONFIG_PATH }} {{ KUBECTL_BIN }} -n {{ NAMESPACE }} set env deployment --all TZ={{ TZ_VALUE }};
+          KUBECONFIG={{ KUBECONFIG_PATH }} {{ KUBECTL_BIN }} -n {{ NAMESPACE }} set env deploy/{{ JENKINS_DEPLOY_NAME }} JENKINS_JAVA_OPTIONS='-Duser.timezone={{ TZ_VALUE }}'
+      when: not kubectl_stat.stat.exists
+

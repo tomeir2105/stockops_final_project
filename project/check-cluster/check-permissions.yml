@@ -1,0 +1,115 @@
+---
+- name: Audit stockops ownership, modes, and ACLs (read-only)
+  hosts: k3srouter_host
+  gather_facts: no
+  become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    app_paths_eff: "{{ APP_DIRS | map(attribute='path') | list }}"
+
+  tasks:
+    - name: Ensure 'acl' package is installed (provides getfacl/setfacl)
+      become: yes
+      ansible.builtin.package:
+        name: acl
+        state: present
+      changed_when: false
+
+    # -------------------------------------------------------------
+    # Collect user/group info since pw_name/gr_name may be missing
+    # -------------------------------------------------------------
+    - name: Load passwd database
+      ansible.builtin.getent:
+        database: passwd
+
+    - name: Load group database
+      ansible.builtin.getent:
+        database: group
+
+    - name: "Build uid->name map (passwd: ['x', UID, GID, ...])"
+      no_log: true
+      ansible.builtin.set_fact:
+        uid_to_name: "{{ (uid_to_name | default({})) | combine({ (item.value[1] | string): item.key }) }}"
+      loop: "{{ query('dict', getent_passwd) }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: "Build gid->name map (group: ['x', GID, MEMBERS])"
+      ansible.builtin.set_fact:
+        gid_to_name: "{{ (gid_to_name | default({})) | combine({ (item.value[1] | string): item.key }) }}"
+      loop: "{{ query('dict', getent_group) }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # -------------------------------------------------------------
+    # Directory checks
+    # -------------------------------------------------------------
+    - name: Stat app directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ app_paths_eff }}"
+      register: dir_stats
+
+    - name: Show directory ownership/mode (only existing)
+      ansible.builtin.debug:
+        msg:
+          - "DIR: {{ item.stat.path }}"
+          - "owner: {{ item.stat.pw_name | default(item.stat.uid, true) }}  group: {{ item.stat.gr_name | default(item.stat.gid, true) }}  mode(octal): {{ item.stat.mode if (item.stat.mode is string) else ('%04o' % item.stat.mode) }}"
+      loop: "{{ dir_stats.results | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | list }}"
+      loop_control:
+        label: "{{ item.stat.path }}"
+
+    - name: Report missing directories
+      ansible.builtin.debug:
+        msg:
+          - "DIR: {{ item.invocation.module_args.path }}"
+          - "exists: false"
+      loop: "{{ dir_stats.results }}"
+      when: not (item.stat.exists | bool)
+
+    # -------------------------------------------------------------
+    # .env files
+    # -------------------------------------------------------------
+    - name: Stat .env files (if present)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ ENV_FILES }}"
+      register: env_stats
+
+    - name: Show .env ownership/mode (missing files are ok)
+      ansible.builtin.debug:
+        msg:
+          - "FILE: {{ item.stat.exists | bool | ternary(item.stat.path, item.invocation.module_args.path) }}"
+          - "exists: {{ item.stat.exists }}"
+          - >-
+            owner: {{
+              (item.stat.pw_name
+                | default(uid_to_name[item.stat.uid | string]
+                | default(item.stat.uid)))
+            }}
+            group: {{
+              (item.stat.gr_name
+                | default(gid_to_name[item.stat.gid | string]
+                | default(item.stat.gid)))
+            }}
+            mode(octal): {{ item.stat.exists | bool | ternary(item.stat.mode, 'n/a') }}
+      loop: "{{ env_stats.results }}"
+
+    # -------------------------------------------------------------
+    # ACLs
+    # -------------------------------------------------------------
+    - name: Read ACLs with getfacl (existing dirs only)
+      ansible.builtin.command: "getfacl -p {{ item.stat.path }}"
+      loop: "{{ dir_stats.results }}"
+      when: item.stat.exists | bool
+      register: facl_out
+      changed_when: false
+      failed_when: false
+
+    - name: Print ACLs
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines | default(['(no getfacl output)']) }}"
+      loop: "{{ facl_out.results }}"
+

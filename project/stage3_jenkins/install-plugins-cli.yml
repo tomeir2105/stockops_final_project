@@ -1,0 +1,185 @@
+---
+# Install plugins (and deps) into LIVE $JENKINS_HOME/plugins, fix ownership, restart, verify, and print diagnostics.
+
+- name: Install Jenkins plugins perfectly (CLI -> live dir + REST + verify)
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"  # needs: JENKINS_PLUGINS, JENKINS_API_PORT, JENKINS_ADMIN_USER, JENKINS_ADMIN_PASS, optional JENKINS_SAFE_RESTART
+
+  vars:
+    kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
+    test_plugins: "{{ (JENKINS_PLUGINS | default([])) | join(' ') }}"
+    do_restart: "{{ JENKINS_SAFE_RESTART | default(true) }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    - name: Validate plugin list is not empty
+      assert:
+        that: (JENKINS_PLUGINS | default([])) | length > 0
+        fail_msg: "JENKINS_PLUGINS is empty; add plugins in vars.yml (e.g., ['kubernetes'])."
+
+    - name: Pick kubectl or 'k3s kubectl'
+      shell: "command -v kubectl >/dev/null 2>&1 && echo kubectl || echo 'k3s kubectl'"
+      args: { executable: /bin/bash }
+      register: kubectl_cmd
+      changed_when: false
+
+    - name: Find Jenkins pod and namespace
+      shell: >
+        {{ kubectl_cmd.stdout }} get pods -A -l app=jenkins
+        -o jsonpath='{.items[0].metadata.namespace} {.items[0].metadata.name}'
+      args: { executable: /bin/bash }
+      register: pod_info
+      changed_when: false
+      failed_when: pod_info.stdout | trim == ""
+
+    - name: Set facts
+      set_fact:
+        jns:  "{{ (pod_info.stdout | trim).split(' ')[0] }}"
+        jpod: "{{ (pod_info.stdout | trim).split(' ')[1] }}"
+
+    - name: Show target plugins
+      debug:
+        msg:
+          - "Namespace: {{ jns }}"
+          - "Pod: {{ jpod }}"
+          - "Requested plugins: {{ JENKINS_PLUGINS | join(', ') }}"
+
+    - name: Verify jenkins-plugin-cli is available
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}"
+        exec -i "{{ jpod }}" -- bash -lc 'PATH=/opt/java/openjdk/bin:$PATH jenkins-plugin-cli --version'
+      args: { executable: /bin/bash }
+      register: plugin_cli_ver
+      changed_when: false
+      failed_when: plugin_cli_ver.rc != 0 or (plugin_cli_ver.stdout | trim) == ""
+
+    - name: Detect JENKINS_HOME inside pod (fallback to /var/jenkins_home)
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}"
+        exec -i "{{ jpod }}" -- bash -lc 'echo "${JENKINS_HOME:-/var/jenkins_home}"'
+      args: { executable: /bin/bash }
+      register: jhome_cmd
+      changed_when: false
+
+    - name: Set JENKINS_HOME + paths
+      set_fact:
+        jenkins_home: "{{ jhome_cmd.stdout | trim }}"
+        live_plugins_dir: "{{ (jhome_cmd.stdout | trim) + '/plugins' }}"
+
+    - name: Ensure live plugins dir exists
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc 'mkdir -p "{{ live_plugins_dir }}"'
+      args: { executable: /bin/bash }
+      changed_when: true
+
+    - name: Determine ownership of $JENKINS_HOME
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'stat -c "%u:%g" "{{ jenkins_home }}"'
+      args: { executable: /bin/bash }
+      register: home_owner
+      changed_when: false
+
+    - name: Install requested plugins (and deps) into LIVE dir
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'set -euo pipefail; PATH=/opt/java/openjdk/bin:$PATH
+         jenkins-plugin-cli --plugins "{{ test_plugins }}" --plugin-download-directory "{{ live_plugins_dir }}" --verbose'
+      args: { executable: /bin/bash }
+      register: install_out
+      changed_when: true
+
+    - name: Fix ownership of live plugins dir to match $JENKINS_HOME
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'chown -R {{ home_owner.stdout | trim }} "{{ live_plugins_dir }}"'
+      args: { executable: /bin/bash }
+      changed_when: true
+
+    - name: List files created in live dir (sanity)
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'shopt -s nullglob; cnt=$(ls -1 "{{ live_plugins_dir }}"/*.jpi "{{ live_plugins_dir }}"/*.hpi 2>/dev/null | wc -l);
+         echo "count=$cnt";
+         ls -1 "{{ live_plugins_dir }}"/*.jpi "{{ live_plugins_dir }}"/*.hpi 2>/dev/null | head -20 || true'
+      args: { executable: /bin/bash }
+      register: live_list
+      changed_when: false
+
+    - name: Fetch crumb JSON (for CSRF)
+      when: do_restart
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'curl -sS -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} "http://localhost:{{ JENKINS_API_PORT }}/crumbIssuer/api/json"'
+      args: { executable: /bin/bash }
+      register: crumb_json
+      changed_when: false
+
+    - name: Build crumb header (handle CSRF disabled)
+      when: do_restart
+      set_fact:
+        _crumb_obj: "{{ (crumb_json.stdout | trim) and (crumb_json.stdout | from_json) or {} }}"
+        crumb_header: "{{ (_crumb_obj.crumbRequestField | default('')) and (_crumb_obj.crumb | default('')) and (_crumb_obj.crumbRequestField ~ ': ' ~ _crumb_obj.crumb) or '' }}"
+
+    - name: Trigger safe restart via REST (with/without crumb)
+      when: do_restart
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'if [ -n "{{ crumb_header }}" ]; then
+           curl -sS -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} -H "{{ crumb_header }}" -X POST "http://localhost:{{ JENKINS_API_PORT }}/safeRestart";
+         else
+           curl -sS -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} -X POST "http://localhost:{{ JENKINS_API_PORT }}/safeRestart";
+         fi'
+      args: { executable: /bin/bash }
+      register: restart_post
+      changed_when: true
+
+    - name: Wait for Jenkins pod to become Ready again
+      when: do_restart
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" wait --for=condition=Ready pod -l app=jenkins --timeout=300s
+      args: { executable: /bin/bash }
+      register: wait_out
+      changed_when: false
+      failed_when: "'condition met' not in wait_out.stdout"
+
+    - name: Fetch installed plugins JSON (verify on live instance)
+      shell: >
+        {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
+        'curl -sS -u {{ JENKINS_ADMIN_USER }}:{{ JENKINS_ADMIN_PASS }} "http://localhost:{{ JENKINS_API_PORT }}/pluginManager/api/json?depth=1"'
+      args: { executable: /bin/bash }
+      register: plugins_json
+      changed_when: false
+      failed_when: plugins_json.rc != 0 or (plugins_json.stdout | trim) == ""
+
+    - name: Parse installed plugins JSON
+      set_fact:
+        _plugins_obj: "{{ plugins_json.stdout | from_json }}"
+        installed_plugins: "{{ _plugins_obj.plugins | default([]) }}"
+        installed_names: "{{ (installed_plugins | map(attribute='shortName') | list) | default([]) }}"
+
+    - name: Assert that requested plugins are installed
+      assert:
+        that: item in installed_names
+        fail_msg: "Requested plugin '{{ item }}' was not found in installed plugins."
+        success_msg: "Plugin '{{ item }}' is installed."
+      loop: "{{ JENKINS_PLUGINS }}"
+
+    - name: Summary
+      debug:
+        msg:
+          - "jenkins-plugin-cli: {{ plugin_cli_ver.stdout | trim }}"
+          - "JENKINS_HOME: {{ jenkins_home }}"
+          - "Live plugins dir: {{ live_plugins_dir }}"
+          - "Live dir sample:\n{{ (live_list.stdout_lines | default([]))[:20] | join('\n') }}"
+          - "Restart performed: {{ do_restart | ternary('yes','no') }}"
+          - "Requested: {{ JENKINS_PLUGINS | join(', ') }}"
+          - "Installed names ({{ installed_names | length }}): {{ installed_names | join(', ') }}"
+          - "Install log (first lines):\n{{ (install_out.stdout_lines | default([]))[:30] | join('\n') }}"
+

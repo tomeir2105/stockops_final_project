@@ -1,0 +1,66 @@
+---
+# k3s-01-cgroups.yml — enable cgroup v2 memory on workers (RPi/Debian firmware path ONLY)
+- name: Enable cgroup v2 memory on workers
+  hosts: k3s_workers
+  become: yes
+  gather_facts: no
+
+  vars:
+    required_flags:
+      - cgroup_memory=1
+      - cgroup_enable=memory
+      - systemd.unified_cgroup_hierarchy=1
+    cmdline_path: /boot/firmware/cmdline.txt
+
+  tasks:
+    - name: Ensure /boot/firmware/cmdline.txt exists
+      ansible.builtin.stat:
+        path: "{{ cmdline_path }}"
+      register: cmd_fw
+
+    - name: Fail if /boot/firmware/cmdline.txt is missing
+      ansible.builtin.fail:
+        msg: "/boot/firmware/cmdline.txt not found (we do not modify /boot/cmdline.txt)."
+      when: not cmd_fw.stat.exists
+
+    - name: Read current cmdline
+      ansible.builtin.slurp:
+        src: "{{ cmdline_path }}"
+      register: cmdline_raw
+
+    # FIX: define cmdline_current first
+    - name: Set current cmdline fact
+      ansible.builtin.set_fact:
+        cmdline_current: "{{ (cmdline_raw.content | b64decode).strip() }}"
+
+    # FIX: compute new line in a separate task
+    - name: Compose updated cmdline string (append missing flags)
+      ansible.builtin.set_fact:
+        cmdline_new: >-
+          {{ cmdline_current }}
+          {% for f in required_flags if f not in cmdline_current %} {{ f }}{% endfor %}
+
+    - name: Write cmdline only if changed (no backup)
+      ansible.builtin.copy:
+        dest: "{{ cmdline_path }}"
+        content: "{{ cmdline_new | regex_replace('\\s+', ' ') }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+      when: cmdline_new | trim != cmdline_current | trim
+      register: cmdline_changed
+
+    - name: Reboot to apply kernel cmdline
+      ansible.builtin.reboot:
+        msg: "Rebooting to enable cgroup v2 memory"
+        reboot_timeout: 600
+        pre_reboot_delay: 2
+        post_reboot_delay: 10
+      when: cmdline_changed is changed
+
+    - name: Verify memory controller present after reboot
+      ansible.builtin.shell: "grep -w memory /sys/fs/cgroup/cgroup.controllers"
+      register: cgcheck
+      changed_when: false
+      failed_when: cgcheck.rc != 0
+

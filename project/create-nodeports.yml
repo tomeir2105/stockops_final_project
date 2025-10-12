@@ -1,0 +1,196 @@
+---
+- name: "Ensure NodePort services exist for Grafana, InfluxDB, Jenkins (simple/lenient)"
+  hosts: k3s_server
+  become: yes
+  gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/vars.yml"
+
+  vars:
+    ns: "observability"
+    node_ip: "192.168.50.101"
+    jenkins_agent_nodeport: "{{ JENKINS_AGENT_NODEPORT | default(30500) }}"
+
+  tasks:
+    - name: "Detect kubectl (prefer kubectl, else k3s kubectl)"
+      shell: |
+        if command -v kubectl >/dev/null 2>&1; then
+          echo kubectl
+        else
+          echo "k3s kubectl"
+        fi
+      args: { executable: /bin/bash }
+      register: kubectl_cmd
+      changed_when: false
+
+    # ─────────────────────────────────────────────────────────────
+    # Create (or re-apply) Grafana — don't fail on port conflicts
+    # ─────────────────────────────────────────────────────────────
+    - name: "Create/ensure Grafana NodePort ({{ GRAFANA_NODEPORT }})"
+      shell: |
+        {{ kubectl_cmd.stdout }} -n {{ ns }} apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: grafana-nodeport
+          namespace: {{ ns }}
+        spec:
+          type: NodePort
+          selector:
+            app: grafana
+          ports:
+            - port: 3000
+              targetPort: 3000
+              nodePort: {{ GRAFANA_NODEPORT }}
+        EOF
+      args: { executable: /bin/bash }
+      register: grafana_apply
+      failed_when: false
+      changed_when: "'created' in grafana_apply.stdout or 'configured' in grafana_apply.stdout"
+
+    - name: "Grafana apply (raw)"
+      debug:
+        msg: |
+          rc={{ grafana_apply.rc }}
+          stdout:
+          {{ (grafana_apply.stdout | default('')).strip() }}
+          stderr:
+          {{ (grafana_apply.stderr | default('')).strip() }}
+
+    # ─────────────────────────────────────────────────────────────
+    # Create (or re-apply) InfluxDB — don't fail on port conflicts
+    # ─────────────────────────────────────────────────────────────
+    - name: "Create/ensure InfluxDB NodePort ({{ INFLUX_NODEPORT }})"
+      shell: |
+        {{ kubectl_cmd.stdout }} -n {{ ns }} apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: influxdb-nodeport
+          namespace: {{ ns }}
+        spec:
+          type: NodePort
+          selector:
+            app: influxdb
+          ports:
+            - port: 8086
+              targetPort: 8086
+              nodePort: {{ INFLUX_NODEPORT }}
+        EOF
+      args: { executable: /bin/bash }
+      register: influx_apply
+      failed_when: false
+      changed_when: "'created' in influx_apply.stdout or 'configured' in influx_apply.stdout"
+
+    - name: "InfluxDB apply (raw)"
+      debug:
+        msg: |
+          rc={{ influx_apply.rc }}
+          stdout:
+          {{ (influx_apply.stdout | default('')).strip() }}
+          stderr:
+          {{ (influx_apply.stderr | default('')).strip() }}
+
+    # ─────────────────────────────────────────────────────────────
+    # Create (or re-apply) Jenkins — don't fail on port conflicts
+    # ─────────────────────────────────────────────────────────────
+    - name: "Create/ensure Jenkins NodePort (web {{ JENKINS_NODEPORT }}, agent {{ jenkins_agent_nodeport }})"
+      shell: |
+        {{ kubectl_cmd.stdout }} -n {{ ns }} apply -f - <<EOF
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: jenkins-nodeport
+          namespace: {{ ns }}
+        spec:
+          type: NodePort
+          selector:
+            app: jenkins
+          ports:
+            - name: http
+              port: 8080
+              targetPort: 8080
+              nodePort: {{ JENKINS_NODEPORT }}
+            - name: agent
+              port: 50000
+              targetPort: 50000
+              nodePort: {{ jenkins_agent_nodeport }}
+        EOF
+      args: { executable: /bin/bash }
+      register: jenkins_apply
+      failed_when: false
+      changed_when: "'created' in jenkins_apply.stdout or 'configured' in jenkins_apply.stdout"
+
+    - name: "Jenkins apply (raw)"
+      debug:
+        msg: |
+          rc={{ jenkins_apply.rc }}
+          stdout:
+          {{ (jenkins_apply.stdout | default('')).strip() }}
+          stderr:
+          {{ (jenkins_apply.stderr | default('')).strip() }}
+
+    # ─────────────────────────────────────────────────────────────
+    # Final report — RAW outputs only (no mapping/parsing)
+    # ─────────────────────────────────────────────────────────────
+    - name: "All NodePort services (raw list)"
+      shell: |
+        {{ kubectl_cmd.stdout }} get svc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{range .spec.ports[*]}{.nodePort}{" "}{end}{"\n"}{end}'
+      args: { executable: /bin/bash }
+      register: all_nodeports
+      changed_when: false
+      failed_when: false
+
+    - name: "RAW: All NodePort services (namespace service nodePorts...)"
+      debug:
+        msg: |
+          {{ (all_nodeports.stdout | default('')).rstrip() }}
+
+    - name: "RAW: Lines containing Grafana desired port {{ GRAFANA_NODEPORT }}"
+      shell: |
+        echo "{{ all_nodeports.stdout }}" | grep -w {{ GRAFANA_NODEPORT }} || echo "<free>"
+      args: { executable: /bin/bash }
+      register: g_line
+      changed_when: false
+      failed_when: false
+
+    - name: "RAW: Lines containing InfluxDB desired port {{ INFLUX_NODEPORT }}"
+      shell: |
+        echo "{{ all_nodeports.stdout }}" | grep -w {{ INFLUX_NODEPORT }} || echo "<free>"
+      args: { executable: /bin/bash }
+      register: i_line
+      changed_when: false
+      failed_when: false
+
+    - name: "RAW: Lines containing Jenkins WEB desired port {{ JENKINS_NODEPORT }}"
+      shell: |
+        echo "{{ all_nodeports.stdout }}" | grep -w {{ JENKINS_NODEPORT }} || echo "<free>"
+      args: { executable: /bin/bash }
+      register: jw_line
+      changed_when: false
+      failed_when: false
+
+    - name: "RAW: Lines containing Jenkins AGENT desired port {{ jenkins_agent_nodeport }}"
+      shell: |
+        echo "{{ all_nodeports.stdout }}" | grep -w {{ jenkins_agent_nodeport }} || echo "<free>"
+      args: { executable: /bin/bash }
+      register: ja_line
+      changed_when: false
+      failed_when: false
+
+    - name: "Summary (raw lines)"
+      debug:
+        msg: |
+          Grafana ({{ GRAFANA_NODEPORT }}): {{ (g_line.stdout | default('')).rstrip() }}
+          InfluxDB ({{ INFLUX_NODEPORT }}): {{ (i_line.stdout | default('')).rstrip() }}
+          Jenkins (web {{ JENKINS_NODEPORT }}): {{ (jw_line.stdout | default('')).rstrip() }}
+          Jenkins (agent {{ jenkins_agent_nodeport }}): {{ (ja_line.stdout | default('')).rstrip() }}
+
+    - name: "Access URLs (best effort)"
+      debug:
+        msg: |
+          Grafana  → http://{{ node_ip }}:{{ GRAFANA_NODEPORT }}
+          InfluxDB → http://{{ node_ip }}:{{ INFLUX_NODEPORT }}
+          Jenkins  → http://{{ node_ip }}:{{ JENKINS_NODEPORT }}
+          Jenkins Agent TCP → {{ node_ip }}:{{ jenkins_agent_nodeport }}
+

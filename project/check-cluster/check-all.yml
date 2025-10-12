@@ -1,0 +1,24 @@
+---
+# Run all cluster checks in sequence
+# Usage:
+#   ap check-all.yml
+#   ap check-all.yml --tags connectivity,services
+
+- import_playbook: check-connectivity.yml
+  tags: [connectivity]
+
+- import_playbook: check-time.yml
+  tags: [time]
+
+- import_playbook: check-nfs-ssh.yml
+  tags: [nfs,ssh]
+
+- import_playbook: check-permissions.yml
+  tags: [permissions]
+
+- import_playbook: check-services.yml
+  tags: [services]
+
+- import_playbook: check-pods.yml
+  tags: [pods]
+
