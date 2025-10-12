@@ -1,4 +1,184 @@
-# Example vars (no real secrets)
-GRAFANA_TOKEN: "<REPLACE_WITH_TOKEN_AT_DEPLOY_TIME>"
-INFLUXDB_ADMIN_TOKEN: "<REPLACE_WITH_TOKEN_AT_DEPLOY_TIME>"
-# Real values should live in project/group_vars/ansible_env.yml (gitignored)
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: Cluster & Environment
+# ─────────────────────────────────────────────────────────────────────────────
+NAMESPACE: stockops
+KUBECTL: "/usr/local/bin/kubectl"
+KUBECTL_SERVER_HOST: "k3s1"
+NODE_IP: 192.168.50.101
+SUBNET_CIDR: 192.168.50.0/24
+TARGET_USER: user
+KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+TIMEZONE: "Asia/Jerusalem"
+
+# Groups to render into /etc/hosts on all nodes (must exist in inventory)
+HOSTS_GROUPS:
+  - k3srouter_host
+  - k3s_server
+  - k3s_workers
+
+# Controller (k3srouter_host) SSH file paths
+CONTROLLER_KEY_PATH: /home/user/.ssh/ansible_ed25519
+CONTROLLER_KNOWN_HOSTS_PATH: /home/user/.ssh/known_hosts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: NFS — Server (exports) & Client (mounts)
+# ─────────────────────────────────────────────────────────────────────────────
+# Server-side export (folder-only export on sda)
+NFS_EXPORTS_FILE: /etc/exports.d/k3s_storage.exports
+NFS_EXPORT_OPTS: "rw,sync,no_subtree_check,root_squash"
+NFS_SERVER_IP: 192.168.50.1
+NFS_ALLOWED_CIDR: 192.168.50.0/24
+NFS_MOUNTPOINT: /mnt/k3s_storage
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: Filesystem Bootstrap — App directories on NFS share
+# ─────────────────────────────────────────────────────────────────────────────
+APP_DIRS:
+  - { path: "/mnt/k3s_storage/stockops", owner: "1000", group: "1000", mode: "0777" }
+  - { path: "/mnt/k3s_storage/jenkins",         owner: "1000", group: "1000", mode: "0770"  }
+  - { path: "/mnt/k3s_storage/grafana",         owner: "472",  group: "472",  mode: "02775" }
+  - { path: "/mnt/k3s_storage/influxdb",        owner: "1000", group: "1000", mode: "2700"  }
+  - { path: "/mnt/k3s_storage/stockops/stocks", owner: "1000", group: "1000", mode: "0770"  }
+  - { path: "/mnt/k3s_storage/stockops/news",   owner: "1000", group: "1000", mode: "0770"  }
+
+APP_PVCS:
+  - { name: jenkins-pvc,  pv: jenkins-pv }
+  - { name: news-pvc,     pv: news-pv }
+  - { name: stocks-pvc,   pv: stocks-pv }
+  - { name: grafana-pvc,  pv: pv-grafana }
+  - { name: influxdb-pvc, pv: influxdb-pv }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: Stockops
+# ─────────────────────────────────────────────────────────────────────────────
+STOCKOPS_ROOT: "{{ NFS_MOUNTPOINT }}/stockops"
+NEWS_NFS_PATH:   "{{ STOCKOPS_ROOT }}/news"
+NEWS_FEEDS_PATH: "{{ NEWS_NFS_PATH }}/feeds.yaml"
+STOCKS_NFS_PATH: "{{ STOCKOPS_ROOT }}/stocks"
+STOCKS_FEEDS_PATH: "{{ STOCKS_NFS_PATH }}/feeds.yaml"
+NEWS_ENV_PATH: "{{ NEWS_NFS_PATH }}/.env"
+STOCKS_ENV_PATH: "{{ STOCKS_NFS_PATH }}/.env"
+ENV_FILES:
+  - "{{ NEWS_ENV_PATH }}"
+  - "{{ STOCKS_ENV_PATH }}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: Container Registry / Images
+# ─────────────────────────────────────────────────────────────────────────────
+IMAGE_PLATFORM: "linux/arm64"
+REGISTRIES_MIRRORS: []
+DOCKERHUB_USER: meir25
+DOCKERHUB_PRIVATE: false
+PREPULL_IMAGES:
+  - "docker.io/library/influxdb:2.7"
+  - "docker.io/grafana/grafana:10.4.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: Core Apps — Jenkins
+# ─────────────────────────────────────────────────────────────────────────────
+JENKINS_NODEPORT: 30080
+JENKINS_API_PORT: 8080
+JENKINS_URL: "http://{{ NODE_IP }}:{{ JENKINS_NODEPORT }}"
+JENKINS_STORAGE: 10Gi
+JENKINS_REPLICAS: 1
+JENKINS_TAG: "lts-jdk17"
+JENKINS_IMAGE_REPO: "docker.io/{{ DOCKERHUB_USER }}/jenkins"
+# Resources
+JENKINS_CPU_REQUEST: "200m"
+JENKINS_CPU_LIMIT:   "1000m"
+JENKINS_MEM_REQUEST: "512Mi"
+JENKINS_MEM_LIMIT:   "2Gi"
+# Admin (consider secret)
+JENKINS_ADMIN_USER: admin
+JENKINS_ADMIN_PASS: "admin"
+JENKINS_SAFE_RESTART: true    # RESTART AFTER PLUGIN INSTALL
+JENKINS_PLUGINS:
+  - kubernetes
+  - git
+  - blueocean
+  - pipeline-stage-view
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: Core Apps — Grafana
+# ─────────────────────────────────────────────────────────────────────────────
+GRAFANA_NODEPORT: 30030
+GRAFANA_API_PORT: 3000
+GRAFANA_URL: "http://{{ NODE_IP }}:{{ GRAFANA_NODEPORT }}/"
+
+GRAFANA_TOKEN: "<ADD_YOUR_TOKEN>"
+
+GRAFANA_STORAGE: 5Gi
+GRAFANA_REPLICAS: 1
+GRAFANA_TAG: "10.4.0"
+GRAFANA_IMAGE_REPO: "docker.io/{{ DOCKERHUB_USER }}/grafana"
+# Resources
+GRAFANA_CPU_REQUEST: "100m"
+GRAFANA_CPU_LIMIT:   "500m"
+GRAFANA_MEM_REQUEST: "256Mi"
+GRAFANA_MEM_LIMIT:   "1Gi"
+# Admin (consider secret)
+GRAFANA_ADMIN_USER: admin
+GRAFANA_ADMIN_PASSWORD: "ChangeMe123!"
+DASHBOARDS_DIR:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: Core Apps — InfluxDB
+# ─────────────────────────────────────────────────────────────────────────────
+INFLUX_NODEPORT: 30886
+INFLUX_API_PORT: 8086
+INFLUXDB_URL: "http://influxdb.stockops.svc.cluster.local:{{ INFLUX_API_PORT }}"
+INFLUXDB_STORAGE: 20Gi
+INFLUXDB_REPLICAS: 1
+INFLUXDB_TAG: "2.7"
+INFLUXDB_IMAGE_REPO: "docker.io/{{ DOCKERHUB_USER }}/influxdb"
+# Resources
+INFLUXDB_CPU_REQUEST: "200m"
+INFLUXDB_CPU_LIMIT:   "1000m"
+INFLUXDB_MEM_REQUEST: "512Mi"
+INFLUXDB_MEM_LIMIT:   "2Gi"
+# Admin / Org (consider secret)
+INFLUXDB_ADMIN_USER: admin
+INFLUXDB_ADMIN_PASSWORD: "ChangeMe123!"
+INFLUXDB_ADMIN_TOKEN: "<ADD_YOUR_TOKEN>"
+INFLUXDB_ORG: home
+INFLUXDB_BUCKET: stockops
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: StockOps Fetchers — Global rollout knob
+# ─────────────────────────────────────────────────────────────────────────────
+FETCHERS_CONFIG_REV: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: StockOps — Stocks Fetcher
+# ─────────────────────────────────────────────────────────────────────────────
+STOCKS_IMAGE_REPO: "docker.io/{{ DOCKERHUB_USER }}/stockops-stocks"
+STOCKS_TAG: "latest"
+STOCKS_REPLICAS: 1
+# Resources (RPi-friendly)
+STOCKS_CPU_REQUEST: "75m"
+STOCKS_CPU_LIMIT:   "300m"
+STOCKS_MEM_REQUEST: "128Mi"
+STOCKS_MEM_LIMIT:   "256Mi"
+STOCKS_STORAGE: "1Gi"
+# Runtime config
+STOCKS_TICKERS: "AAPL,MSFT,GOOGL"
+STOCKS_POLL_SECONDS: "60"
+STOCKS_YF_INTERVAL: "1m"
+STOCKS_YF_PERIOD:   "5d"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZONE: StockOps — News Fetcher
+# ─────────────────────────────────────────────────────────────────────────────
+NEWS_IMAGE_REPO: "docker.io/{{ DOCKERHUB_USER }}/stockops-news"
+NEWS_TAG: "latest"
+NEWS_REPLICAS: 1
+# Resources
+NEWS_CPU_REQUEST: "50m"
+NEWS_CPU_LIMIT:   "250m"
+NEWS_MEM_REQUEST: "96Mi"
+NEWS_MEM_LIMIT:   "192Mi"
+NEWS_STORAGE: "1Gi"
+# Runtime config
+NEWS_TICKERS: "AAPL,MSFT,GOOGL"
+NEWS_POLL_SECONDS: "120"
+NEWS_DEFAULT_SOURCES: ""
