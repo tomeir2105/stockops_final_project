@@ -80,7 +80,7 @@ load_env() {
   local ENV_SRC="${CONFIG_DIR}/.env"
   if [[ -f "$ENV_SRC" ]]; then
     while IFS= read -r raw || [ -n "$raw" ]; do
-      local line="${raw%$'\r'}"
+      local line="${raw%$'\r'}"   # strip CR if present
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       if [[ "$line" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*= ]]; then
         eval "export ${line}"
@@ -209,8 +209,7 @@ apply_regdom() {
 }
 
 # --- NetworkManager integration ----------------------------------------------
-# Note: nm_mark_unmanaged is defined earlier; the version below is a more direct nmcli approach.
-# The latter definition overrides the earlier one in Bash, which is acceptable.
+# Mark an interface unmanaged by NetworkManager (safe no-op if nmcli missing)
 nm_mark_unmanaged() {
   local iface="$1"
   if command -v nmcli >/dev/null 2>&1; then
@@ -244,7 +243,8 @@ iface_diag() {
   echo "-- routes touching ${iface} --"
   ip route show dev "$iface" || true
   echo "-- dmesg (last 80 lines filtered for ${iface}/wlan) --"
-  dmesg | egrep -i "(firmware|error|warn|wlan|${iface})" | tail -n 80 || true
+  # Replaced deprecated egrep with grep -E
+  dmesg | grep -Ei "(firmware|error|warn|wlan|${iface})" | tail -n 80 || true
   return 0
 }
 
@@ -259,6 +259,22 @@ restart_service_if_active() {
 stop_service_if_running() { local svc="$1"; systemctl stop "$svc" 2>/dev/null || true; }
 start_service()           { local svc="$1"; systemctl start "$svc" 2>/dev/null || true; }
 enable_service()          { local svc="$1"; systemctl enable "$svc" 2>/dev/null || true; }
+
+# Start a systemd service and show concise status; print logs on failure
+start_service_and_verify() {
+  local svc="$1"
+  systemctl daemon-reload || true
+  systemctl start "$svc" || true
+  sleep 1
+  if ! systemctl is-active --quiet "$svc"; then
+    log_error "Failed to start service: $svc"
+    systemctl --no-pager --full status "$svc" | sed -n '1,40p' || true
+    journalctl -xeu "$svc" --no-pager -n 80 || true
+    return 1
+  fi
+  systemctl --no-pager --full status "$svc" | sed -n '1,15p' || true
+  return 0
+}
 
 # --- Port checks (DNS/DHCP) ---------------------------------------------------
 # Quick views into listening sockets for common DNS/DHCP ports
@@ -285,4 +301,18 @@ port_in_use() {
   esac
 }
 
-#
+# --- Capability checks --------------------------------------------------------
+# Quick check if the wireless driver supports AP mode
+check_ap_capability() {
+  if ! command -v iw >/dev/null 2>&1; then
+    echo "iw not installed"
+    return 2
+  fi
+  if iw list | awk '/Supported interface modes:/{flag=1;next}/^$/{flag=0}flag' | grep -q '\* AP'; then
+    echo "AP mode supported"
+    return 0
+  else
+    echo "AP mode NOT supported by driver/device"
+    return 1
+  fi
+}
