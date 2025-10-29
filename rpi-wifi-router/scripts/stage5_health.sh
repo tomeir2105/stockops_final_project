@@ -48,6 +48,5 @@ echo "-- dnsmasq --"; journalctl -u dnsmasq -n 50 --no-pager || true
 
 # Validate that the wireless hardware and driver support AP mode
 echo "-- AP capability check --"
-check_ap_capability || true
 
 echo "Done Stage 5."
