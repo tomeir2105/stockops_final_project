@@ -29,21 +29,6 @@ require_root() {
   fi
 }
 
-# Mark an interface unmanaged in NetworkManager (if NM is present) — early variant
-nm_mark_unmanaged() {
-  local iface="$1"
-  if ! command -v nmcli >/dev/null 2>&1; then
-    return 0
-  fi
-  mkdir -p /etc/NetworkManager/conf.d
-  local conf="/etc/NetworkManager/conf.d/99-rpi-router-unmanaged.conf"
-  cat > "$conf" <<EOF
-[keyfile]
-unmanaged-devices=interface-name:${iface}
-EOF
-  systemctl reload NetworkManager 2>/dev/null || true
-}
-
 # --- Env validation -----------------------------------------------------------
 # Required variables that must be present in config/.env
 _required_vars=(
