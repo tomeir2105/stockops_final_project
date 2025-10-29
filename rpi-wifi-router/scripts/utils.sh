@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
-# utils.sh — shared helpers for rpi-wifi-router
-# Safe-by-default bash utilities used by stage scripts.
+######################################
+# Created by : Meir
+# Purpose : Shared helpers for rpi-wifi-router; safe-by-default Bash utilities used by stage scripts
+# Date : 2025-10-29
+# Version : 1
+######################################
 
+# Fail fast on errors, treat unset vars as errors, and trap ERR with -E
 set -Eeuo pipefail
 
 # --- Paths --------------------------------------------------------------------
+# Resolve repository root (one level above this file) and the config directory
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="${ROOT_DIR}/config"
 
 # --- Logging ------------------------------------------------------------------
+# Simple colorized log helpers; write errors to stderr
 log_info()  { printf "\e[1;34m[INFO]\e[0m %s\n"  "$*"; }
 log_warn()  { printf "\e[1;33m[WARN]\e[0m %s\n"  "$*"; }
 log_error() { printf "\e[1;31m[ERR ]\e[0m %s\n"  "$*" 1>&2; }
 
 # --- Safety -------------------------------------------------------------------
+# Ensure the script is running as root; exit with a clear message if not
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     log_error "This script must be run as root (use sudo)."
@@ -21,7 +29,7 @@ require_root() {
   fi
 }
 
-# Mark an interface unmanaged in NetworkManager (if NM is present)
+# Mark an interface unmanaged in NetworkManager (if NM is present) — early variant
 nm_mark_unmanaged() {
   local iface="$1"
   if ! command -v nmcli >/dev/null 2>&1; then
@@ -29,7 +37,6 @@ nm_mark_unmanaged() {
   fi
   mkdir -p /etc/NetworkManager/conf.d
   local conf="/etc/NetworkManager/conf.d/99-rpi-router-unmanaged.conf"
-  # Create/replace a simple unmanaged-devices entry for the LAN iface
   cat > "$conf" <<EOF
 [keyfile]
 unmanaged-devices=interface-name:${iface}
@@ -38,6 +45,7 @@ EOF
 }
 
 # --- Env validation -----------------------------------------------------------
+# Required variables that must be present in config/.env
 _required_vars=(
   WAN_IFACE
   LAN_IFACE
@@ -63,6 +71,7 @@ _required_vars=(
   AP_RSN_PAIRWISE
 )
 
+# Validate presence of required variables; print missing ones and exit
 _validate_required_vars() {
   local missing=()
   for v in "${_required_vars[@]}"; do
@@ -80,6 +89,7 @@ _validate_required_vars() {
 }
 
 # --- Environment loader (robust) ---------------------------------------------
+# Load key=value pairs from config/.env while ignoring comments and blank lines
 load_env() {
   set -a
   local ENV_SRC="${CONFIG_DIR}/.env"
@@ -100,8 +110,8 @@ load_env() {
 }
 
 # --- Package helpers ----------------------------------------------------------
+# Install missing packages only; idempotent across runs
 ensure_pkg() {
-  # Install only the missing packages (idempotent)
   local missing=()
   for pkg in "$@"; do
     if ! dpkg -s "$pkg" >/dev/null 2>&1; then
@@ -115,6 +125,7 @@ ensure_pkg() {
 }
 
 # --- Template rendering -------------------------------------------------------
+# Render a template with envsubst into destination path atomically
 render_template() {
   local src="$1"
   local dst="$2"
@@ -132,11 +143,12 @@ render_template() {
 }
 
 # --- Compatibility wrappers (for existing stage scripts) ----------------------
-# stage2_lan.sh calls these names:
+# Keep these names for legacy calls in stage scripts
 ensure_iface_up() { wait_iface_up "$@"; }
 render()          { render_template "$@"; }
 
 # --- Network helpers ----------------------------------------------------------
+# Print concise link, address, and wireless info for an interface
 print_link_state() {
   local iface="$1"
   echo "---- Link state: ${iface} ----"
@@ -147,6 +159,7 @@ print_link_state() {
   fi
 }
 
+# Wait for interface state UP with retries; print diagnostics if it never comes up
 wait_iface_up() {
   local iface="$1"
   local attempts="${2:-15}"
@@ -163,12 +176,14 @@ wait_iface_up() {
   return 1
 }
 
+# Determine current default route device for internet connectivity
 current_wan_dev() {
   ip route get 1.1.1.1 2>/dev/null | awk '{
     for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}
   }'
 }
 
+# Stop wpa_supplicant on a specific interface to free it for AP mode
 safe_stop_wpa_for_iface() {
   local iface="$1"
   if systemctl list-units | grep -q "wpa_supplicant@${iface}.service"; then
@@ -179,6 +194,7 @@ safe_stop_wpa_for_iface() {
   fi
 }
 
+# Ensure a wireless interface is free from client-mode processes and not the active WAN path
 ensure_iface_free_for_ap() {
   local iface="$1"
   local gwdev
@@ -199,6 +215,7 @@ ensure_iface_free_for_ap() {
   return 0
 }
 
+# Apply regulatory domain for Wi-Fi if iw is available
 apply_regdom() {
   local cc="$1"
   if [[ -n "$cc" ]] && command -v iw >/dev/null 2>&1; then
@@ -207,6 +224,8 @@ apply_regdom() {
 }
 
 # --- NetworkManager integration ----------------------------------------------
+# Note: nm_mark_unmanaged is defined earlier; the version below is a more direct nmcli approach.
+# The latter definition overrides the earlier one in Bash, which is acceptable.
 nm_mark_unmanaged() {
   local iface="$1"
   if command -v nmcli >/dev/null 2>&1; then
@@ -224,6 +243,7 @@ EOF
 }
 
 # --- Diagnostics --------------------------------------------------------------
+# Broad interface diagnostics: rfkill, link, iw info/link, routes, and recent dmesg
 iface_diag() {
   local iface="$1"
   echo "== diag:${iface} =="
@@ -244,6 +264,7 @@ iface_diag() {
 }
 
 # --- Service helpers ----------------------------------------------------------
+# Restart only if enabled or currently active to avoid noisy errors
 restart_service_if_active() {
   local svc="$1"
   if systemctl is-enabled --quiet "$svc" 2>/dev/null || systemctl is-active --quiet "$svc"; then
@@ -255,6 +276,7 @@ start_service()           { local svc="$1"; systemctl start "$svc" 2>/dev/null |
 enable_service()          { local svc="$1"; systemctl enable "$svc" 2>/dev/null || true; }
 
 # --- Port checks (DNS/DHCP) ---------------------------------------------------
+# Quick views into listening sockets for common DNS/DHCP ports
 check_dns_dhcp_ports() {
   echo "UDP/53:"; ss -ulpn 2>/dev/null | grep -E '(:53\s)' || true
   echo "TCP/53:"; ss -ltnp 2>/dev/null | grep -E '(:53\s)' || true
@@ -262,10 +284,10 @@ check_dns_dhcp_ports() {
   echo "UDP/68:"; ss -ulpn 2>/dev/null | grep -E '(:68\s)' || true
 }
 
-# --- Port helpers (used by stage3_ap.sh) --------------------------------------
+# --- Port helpers (used by stage scripts) -------------------------------------
 # Return 0 if a port is in use, 1 if free. Usage: port_in_use udp 53
 port_in_use() {
-  local proto="${1,,}"   # normalize to lowercase
+  local proto="${1,,}"
   local port="$2"
   case "$proto" in
     tcp)
@@ -278,22 +300,4 @@ port_in_use() {
   esac
 }
 
-# Start a systemd service and show a concise status. Returns non-zero on failure.
-# Usage: start_service_and_verify dnsmasq
-start_service_and_verify() {
-  local svc="$1"
-  systemctl daemon-reload || true
-  systemctl start "$svc" || true
-  sleep 1
-  if ! systemctl is-active --quiet "$svc"; then
-    log_error "Failed to start service: $svc"
-    # show last lines to aid debugging without spamming
-    systemctl --no-pager --full status "$svc" || true
-    journalctl -xeu "$svc" --no-pager -n 50 || true
-    return 1
-  fi
-  # brief confirmation
-  systemctl --no-pager --full status "$svc" | sed -n '1,20p' || true
-  return 0
-}
-
+#
