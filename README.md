@@ -1,5 +1,6 @@
 # StockOps
 StockOps is a modular, self-hosted platform for collecting, processing, and visualizing stock data, designed to run efficiently on a Raspberry Pi cluster. It automates data ingestion and real-time analytics while providing clear observability through built-in monitoring and dashboards. With containerized services and reproducible setups, StockOps makes it easy to deploy, track, and manage your data pipelines — giving you full control over your infrastructure without the complexity.
+
 ---
 
 ## Table of Contents
