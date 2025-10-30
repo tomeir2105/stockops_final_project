@@ -1,0 +1,94 @@
+pipeline {
+  agent { label 'K3S1' }
+  triggers { cron('H/3 * * * *') } 
+  options { disableConcurrentBuilds() }
+  stages {
+    stage('pods') {
+      steps {
+        sh 'KUBECONFIG=/home/jenkins/.kube/config kubectl get pods -A -o wide'
+      }
+    }
+stage('Line protocol (print-only)') {
+  steps {
+    sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+# fresh snapshot
+KUBECONFIG=/home/jenkins/.kube/config kubectl get pods -A -o json > pods.json
+
+# Build line protocol with safe tags:
+# - escape spaces/commas/equals
+# - replace empty tags with "none"
+jq -r '
+  def cstatus: (.status.containerStatuses // []);
+  def app: (.metadata.labels["app"] // .metadata.labels["app.kubernetes.io/name"] // "");
+  def ready_ok: (cstatus | map(select(.ready == true)) | length);
+  def ready_total: (cstatus | length);
+  def restarts: (cstatus | map(.restartCount // 0) | add // 0);
+  def age_s: ( now - (.metadata.creationTimestamp
+                       | sub("\\\\.[0-9]+Z$"; "Z")
+                       | fromdateiso8601) | floor );
+  def esc: gsub(" "; "\\\\ ") | gsub(","; "\\\\,") | gsub("="; "\\\\=");
+  def tag: ( . // "" | tostring ) | if . == "" then "none" else (.|esc) end;
+
+  .items[] |
+  ( "k3s_pod"
+    + ",ns="   + (.metadata.namespace | tag)
+    + ",pod="  + (.metadata.name | tag)
+    + ",node=" + (.spec.nodeName | tag)
+    + ",phase="+ (.status.phase | tag)
+    + ",app="  + (app | tag)
+    + " "
+    + "restarts="     + ((restarts|tostring)) + "i"
+    + ",ready_ok="    + ((ready_ok|tostring)) + "i"
+    + ",ready_total=" + ((ready_total|tostring)) + "i"
+    + ",age_s="       + ((age_s|tostring)) + "i"
+  )
+' pods.json > lp.txt
+
+echo "---- preview ----"
+head -n 20 lp.txt || true
+echo "lines: $(wc -l < lp.txt)"
+'''
+    archiveArtifacts artifacts: 'lp.txt', fingerprint: true
+  }
+}
+
+
+
+stage('Send to Influx (once)') {
+  steps {
+    withCredentials([string(credentialsId: 'influxdb_token', variable: 'INFLUX_TOKEN')]) {
+      sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+INFLUX_URL="http://192.168.50.101:30886"
+ORG="monitor"
+BUCKET="k3s_pods_1w"
+
+test -s lp.txt || { echo "lp.txt missing or empty"; exit 1; }
+
+# POST line protocol; Influx v2 returns 204 No Content on success
+HTTP_CODE=$(curl -sS -o /tmp/influx_write.out -w "%{http_code}" \
+  -X POST "$INFLUX_URL/api/v2/write?org=$ORG&bucket=$BUCKET&precision=s" \
+  -H "Authorization: Token $INFLUX_TOKEN" \
+  --data-binary @lp.txt || true)
+
+echo "Influx write HTTP_CODE=$HTTP_CODE"
+if [ "$HTTP_CODE" != "204" ]; then
+  echo "---- response body ----"
+  sed -n '1,120p' /tmp/influx_write.out
+  exit 1
+fi
+
+echo "Write OK (204)"
+'''
+    }
+  }
+}
+
+
+
+
+  }
+}

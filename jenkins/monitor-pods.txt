@@ -1,0 +1,151 @@
+// No stored cron on the job itself
+properties([ pipelineTriggers([]) ])
+
+pipeline {
+  agent any
+
+  environment {
+    // Influx target
+    INFLUX_URL    = 'http://192.168.50.101:30886'
+    INFLUX_ORG    = 'monitor'
+    INFLUX_BUCKET = 'stocks_mon'
+
+    // K8s log source (constants, no Build with Parameters)
+    NAMESPACE     = 'stockops'
+    POD_PATTERN   = 'news'
+    CONTAINER     = ''          // empty = default container
+    FALLBACK_MIN  = '10'        // seed cursor: now - 10m if none exists
+  }
+
+  options {
+    timeout(time: 3, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '50'))
+  }
+
+  // every ~5 minutes
+  triggers {
+    cron('H/5 * * * *')
+  }
+
+  stages {
+    stage('Pull → Parse → Push (dedup by batch time)') {
+      steps {
+        withCredentials([string(credentialsId: 'influxdb_token', variable: 'INFLUX_TOKEN')]) {
+          sh '''
+            set -e
+            set +x  # quiet console
+
+            # Workspace scratch
+            BRDIR=".work_news"
+            mkdir -p "$BRDIR"
+            CURSOR_FILE="$BRDIR/.batch_cursor"   # last processed batch ISO (RFC3339)
+            RAW="$BRDIR/logs.txt"
+            LP="$BRDIR/lp.txt"
+            BATCH_FILE="$BRDIR/batch_iso.txt"
+            : > "$LP"
+            : > "$BATCH_FILE"
+
+            # Seed cursor if missing: now - FALLBACK_MIN minutes (RFC3339 UTC)
+            if [ ! -f "$CURSOR_FILE" ]; then
+              python3 - "$FALLBACK_MIN" > "$CURSOR_FILE" <<'PY'
+import sys, datetime
+mins = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=mins))
+print(ts.isoformat().replace('+00:00','Z'))
+PY
+            fi
+            CURSOR="$(cat "$CURSOR_FILE")"
+
+            # Resolve target pod (first match)
+            POD="$(kubectl get pods -n "$NAMESPACE" -o name | grep -E "$POD_PATTERN" | head -n1 || true)"
+            if [ -z "$POD" ]; then
+              echo "[WARN] No pod matched pattern: $POD_PATTERN (ns=$NAMESPACE)"; exit 0
+            fi
+
+            # Pull logs newer than the cursor
+            if [ -n "$CONTAINER" ]; then
+              kubectl logs "$POD" -c "$CONTAINER" -n "$NAMESPACE" --since-time="$CURSOR" > "$RAW" || true
+            else
+              kubectl logs "$POD" -n "$NAMESPACE" --since-time="$CURSOR" > "$RAW" || true
+            fi
+
+            if [ ! -s "$RAW" ]; then
+              echo "[INFO] No logs after $CURSOR"; exit 0
+            fi
+
+            # Parse only the NEWEST batch by its time signature ("since <ISO>") and build LP
+            python3 - "$NAMESPACE" "$POD" "$RAW" "$LP" "$BATCH_FILE" <<'PY'
+import sys, re, os, datetime, pathlib
+ns, pod, raw_path, lp_path, batch_path = sys.argv[1:6]
+pod = pod.split("/",1)[-1]
+
+news_re  = re.compile(r'^\\[news\\] matched (\\d+) items for ([A-Z0-9_.-]+) since (\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+\\-]\\d{2}:\\d{2}))')
+batch_re = re.compile(r'^\\[influx\\] wrote (\\d+) news points')
+
+def parse_iso(s):
+    s = s.replace('Z','+00:00')
+    return datetime.datetime.fromisoformat(s)
+
+with open(raw_path, 'r', encoding='utf-8', errors='ignore') as f:
+    lines = [ln.rstrip("\\n") for ln in f]
+
+# collect batch timestamps from [news] lines
+batch_ts = [m.group(3) for ln in lines if (m := news_re.search(ln))]
+if not batch_ts:
+    sys.exit(0)
+
+newest_dt  = max(parse_iso(iso) for iso in batch_ts)
+newest_iso = newest_dt.isoformat().replace('+00:00','Z')
+epoch      = int(newest_dt.timestamp())
+
+lp = []
+added_batch = False
+for ln in lines:
+    m = news_re.search(ln)
+    if m and m.group(3).replace('+00:00','Z') == newest_iso:
+        cnt, ticker = m.group(1), m.group(2)
+        lp.append(f'news_counts,ticker={ticker},pod={pod},ns={ns} count={cnt}i {epoch}')
+    m2 = batch_re.search(ln)
+    if m2 and not added_batch:
+        lp.append(f'news_batch,pod={pod},ns={ns} wrote_points={m2.group(1)}i {epoch}')
+        added_batch = True
+
+if lp:
+    pathlib.Path(lp_path).write_text("\\n".join(lp) + "\\n")
+    pathlib.Path(batch_path).write_text(newest_iso + "\\n")
+PY
+
+            # If nothing parsed, stop quietly
+            if [ ! -s "$LP" ] || [ ! -s "$BATCH_FILE" ]; then
+              echo "[INFO] No complete newest batch to process (cursor=$CURSOR)"; exit 0
+            fi
+
+            # Advance cursor to just after this batch
+            python3 - "$(cat "$BATCH_FILE")" > "$CURSOR_FILE" <<'PY'
+import sys, datetime
+iso = sys.argv[1].replace('Z','+00:00')
+dt  = datetime.datetime.fromisoformat(iso)
+print((dt + datetime.timedelta(seconds=1)).isoformat('T') + 'Z')
+PY
+
+            # Push to Influx
+            HTTP=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Token $INFLUX_TOKEN" \
+              -H "Content-Type: text/plain; charset=utf-8" \
+              --data-binary @"$LP" \
+              "$INFLUX_URL/api/v2/write?org=$INFLUX_ORG&bucket=$INFLUX_BUCKET&precision=s")
+
+            if [ "$HTTP" != "204" ]; then
+              echo "[ERROR] Influx write HTTP $HTTP"
+              sed -n '1,50p' "$LP"
+              exit 1
+            fi
+
+            echo "[OK] Pushed $(wc -l < "$LP") lines to $INFLUX_ORG/$INFLUX_BUCKET"
+          '''
+        }
+      }
+    }
+  }
+}

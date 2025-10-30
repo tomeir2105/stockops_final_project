@@ -1,0 +1,134 @@
+// No stored cron on the job itself
+properties([ pipelineTriggers([]) ])
+
+pipeline {
+  agent any
+
+  environment {
+    INFLUX_URL    = 'http://192.168.50.101:30886'
+    INFLUX_ORG    = 'monitor'
+    INFLUX_BUCKET = 'netdata_2h'
+  }
+
+  options {
+    timeout(time: 3, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '50'))
+  }
+
+  triggers {
+    cron('H/3 * * * *')   // every ~3 minutes
+  }
+
+  stages {
+    stage('Fetch & Push (single call per RPi)') {
+      matrix {
+        axes {
+          axis {
+            name 'TARGET'
+            values(
+              'rpi1@http://192.168.50.101:19999',
+              'rpi2@http://192.168.50.102:19999',
+              'rpi3@http://192.168.50.103:19999'
+            )
+          }
+        }
+
+        stages {
+          stage('Pull → Parse → Push') {
+            steps {
+              withCredentials([string(credentialsId: 'influxdb_token', variable: 'INFLUX_TOKEN')]) {
+                sh '''
+                  set -e
+                  set +x  # keep console clean
+
+                  HOST_TAG="${TARGET%@*}"
+                  NETDATA_URL="${TARGET#*@}"
+                  BRDIR=".work_${HOST_TAG}"
+                  mkdir -p "$BRDIR"
+                  LP="$BRDIR/lp.txt"
+                  RAW="$BRDIR/allmetrics.prom"
+
+                  # 1) Pull Netdata once
+                  curl -sS "${NETDATA_URL}/api/v1/allmetrics?format=prometheus&help=no&types=no&timestamps=yes&names=yes&labels=yes" > "$RAW"
+
+                  # 2) Parse CPU/LOAD/MEM/TEMP → Influx line protocol (will be sent)
+                  awk -v host="$HOST_TAG" '
+                    function isnum(x){ return x ~ /^-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$/ }
+                    /^#/ { next }
+                    {
+                      n=NF
+                      if (n>=2 && isnum($(n-1)) && isnum($n)) { val=$(n-1); ts_ms=$n }
+                      if (index($0, "chart=\\"system.load\\"") && index($0, "dimension=\\"load1\\""))                       load1=val
+                      else if (index($0, "chart=\\"system.ram\\"") && index($0, "dimension=\\"used\\""))                  used=val
+                      else if (index($0, "chart=\\"system.cpu\\"") && match($0, /dimension=\\"(user|system|nice|iowait|irq|softirq|steal|guest|guest_nice)\\"/)) cpu+=val
+                      else if (index($0,"sensors") && index($0,"temperature") && index($0,"_alarm")==0 && temp=="")      temp=val
+                    }
+                    END{
+                      ts_s = (ts_ms=="") ? systime() : int(ts_ms/1000)
+                      if (cpu!="")  printf "netdata_cpu,host=%s used_percent=%s %d\\n", host, cpu,  ts_s
+                      if (load1!="")printf "netdata_load,host=%s load1=%s %d\\n",        host, load1,ts_s
+                      if (used!="") printf "netdata_mem,host=%s used_bytes=%s %d\\n",    host, used, ts_s
+                      if (temp!="") printf "netdata_temp,host=%s celsius=%s %d\\n",      host, temp, ts_s
+                    }' "$RAW" > "$LP"
+
+                  # 3) Parse DISK (sum mounts) → compute values
+                  DISK_ENV="$BRDIR/disk.env"
+                  awk '
+                    function isnum(x){ return x ~ /^-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$/ }
+                    /^#/ { next }
+                    {
+                      n=NF
+                      if (n>=2 && isnum($(n-1)) && isnum($n)) { val=$(n-1) }
+                      if (index($0, "chart=\\"disk_space.") && index($0, "dimension=\\"used\\""))  used_sum  += val
+                      if (index($0, "chart=\\"disk_space.") && index($0, "dimension=\\"avail\\"")) free_sum  += val
+                    }
+                    END{
+                      # Your earlier logs show these as GiB already
+                      printf "DISK_USED=%s\\nDISK_FREE=%s\\n", (used_sum+0), (free_sum+0)
+                    }' "$RAW" > "$DISK_ENV"
+
+                  . "$DISK_ENV" || true
+                  USED="${DISK_USED:-0}"
+                  FREE="${DISK_FREE:-0}"
+
+                  echo "[INFO] Disk preview: host=${HOST_TAG} used=${USED} (GiB), free=${FREE} (GiB)"
+                  awk -v host="$HOST_TAG" -v u="$USED" -v f="$FREE" \
+                      'BEGIN{ printf "[INFO] %s disk (sum mounts): used=%.2f GiB, free=%.2f GiB\\n", host, u, f }'
+
+                  # 3b) Build a timestamp (seconds) to match other records
+                  TS_S="$(awk '
+                    function isnum(x){ return x ~ /^[0-9]+$/ }
+                    /^#/ { next }
+                    {
+                      n=NF
+                      if (n>=1 && isnum($n)) { last_ts=$n }
+                    }
+                    END{
+                      if (last_ts == "") { print systime(); }
+                      else { print int(last_ts/1000); }
+                    }' "$RAW")"
+
+                  # 3c) APPEND disk to LP (SEND to Influx together with others)
+                  # Keep the same measurement family; separate fields for clarity.
+                  printf 'netdata_disk,host=%s used_gib=%s,free_gib=%s %s\\n' \
+                    "$HOST_TAG" "$USED" "$FREE" "$TS_S" >> "$LP"
+
+                  # 4) Send CPU/LOAD/MEM/TEMP + DISK to Influx
+                  if [ -s "$LP" ]; then
+                    curl -sS -o /dev/null -w "%{http_code}" \
+                      -H "Authorization: Token $INFLUX_TOKEN" \
+                      -H "Content-Type: text/plain; charset=utf-8" \
+                      --data-binary @"$LP" \
+                      "$INFLUX_URL/api/v2/write?org=$INFLUX_ORG&bucket=$INFLUX_BUCKET&precision=s" \
+                      | grep -qx 204
+                  fi
+                '''
+              }
+            }
+          }
+        } // stages
+      } // matrix
+    } // stage
+  } // stages
+}
