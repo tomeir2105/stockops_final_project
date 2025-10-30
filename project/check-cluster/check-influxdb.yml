@@ -1,0 +1,147 @@
+######################################
+# Created by : Meir
+# Purpose    : Check InfluxDB health, list orgs/buckets, and show field keys
+# Date       : 2025-10-30
+# Version    : 1
+######################################
+---
+- name: List InfluxDB orgs, buckets, and fields
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - "../vars.yml"   # must contain INFLUXDB_ADMIN_TOKEN
+
+  vars:
+    influx_url: "http://192.168.50.101:30886"   # adjust if needed
+    per_page_limit: 100                         # API max is 100
+
+  tasks:
+    - name: Assert required vars exist
+      ansible.builtin.assert:
+        that:
+          - INFLUXDB_ADMIN_TOKEN is defined
+          - influx_url is defined
+          - influx_url | length > 0
+        fail_msg: "Missing INFLUXDB_ADMIN_TOKEN in ../vars.yml or influx_url not set."
+
+    - name: Check InfluxDB /health
+      ansible.builtin.uri:
+        url: "{{ influx_url }}/health"
+        method: GET
+        return_content: true
+        status_code: 200
+        timeout: 10
+      register: health
+      failed_when:
+        - health.status != 200
+        - (health.json is defined and (health.json.status | default('') | lower) != 'pass')
+          and (health.content | default('') is not search('\"status\"\\s*:\\s*\"pass\"'))
+      changed_when: false
+
+    - name: Show health status
+      ansible.builtin.debug:
+        msg: "InfluxDB health: {{ (health.json.status | default('pass')) if (health.json is defined) else 'pass' }}"
+
+    - name: Get orgs
+      ansible.builtin.uri:
+        url: "{{ influx_url }}/api/v2/orgs?limit={{ per_page_limit }}"
+        method: GET
+        headers:
+          Authorization: "Token {{ INFLUXDB_ADMIN_TOKEN }}"
+        return_content: true
+        status_code: 200
+        timeout: 15
+      register: orgs_resp
+      failed_when:
+        - orgs_resp.status != 200
+        - (orgs_resp.json.orgs | default([]) | length) == 0
+      changed_when: false
+
+    - name: Show orgs
+      ansible.builtin.debug:
+        msg: "Orgs: {{ orgs_resp.json.orgs | map(attribute='name') | list }}"
+
+    - name: Pick first org (by order returned)
+      ansible.builtin.set_fact:
+        influx_org_id: "{{ (orgs_resp.json.orgs | first).id }}"
+        influx_org_name: "{{ (orgs_resp.json.orgs | first).name }}"
+
+    - name: Get buckets for org
+      ansible.builtin.uri:
+        url: "{{ influx_url }}/api/v2/buckets?orgID={{ influx_org_id }}&limit={{ per_page_limit }}"
+        method: GET
+        headers:
+          Authorization: "Token {{ INFLUXDB_ADMIN_TOKEN }}"
+        return_content: true
+        status_code: 200
+        timeout: 15
+      register: buckets_resp
+      failed_when:
+        - buckets_resp.status != 200
+      changed_when: false
+
+    - name: Show buckets (name + retention days)
+      ansible.builtin.debug:
+        msg: >-
+          Bucket {{ item.name }} — retention: {{
+            (
+              (item.retentionRules | default([]) | length > 0)
+              and ((item.retentionRules[0].everySeconds | default(0) | int) > 0)
+            )
+            | ternary(((item.retentionRules[0].everySeconds | int) // 86400) ~ 'd', 'infinite')
+          }}
+      loop: "{{ buckets_resp.json.buckets | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build list of bucket names
+      ansible.builtin.set_fact:
+        influx_bucket_names: "{{ (buckets_resp.json.buckets | default([])) | map(attribute='name') | list }}"
+
+    - name: Show field keys for each bucket (limit 50)
+      ansible.builtin.uri:
+        url: "{{ influx_url }}/api/v2/query?org={{ influx_org_name | urlencode }}"
+        method: POST
+        headers:
+          Authorization: "Token {{ INFLUXDB_ADMIN_TOKEN }}"
+          Content-Type: "application/json"
+          Accept: "application/csv"
+        body_format: json
+        body:
+          query: |
+            import "influxdata/influxdb/schema"
+            schema.fieldKeys(bucket: "{{ item }}")
+              |> sort()
+              |> limit(n: 50)
+          type: "flux"
+          dialect:
+            annotations: []
+            header: true
+        return_content: true
+        status_code: 200
+        timeout: 30
+      register: fields_resp
+      loop: "{{ influx_bucket_names }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: fields_resp.status != 200
+
+    - name: Pretty-print field keys (by bucket)
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item }} fields: {{
+            (
+              item.content.split('\n')
+              | select('search', '^[^#].*,.*')
+              | list
+              | map('regex_replace', '^([^,]+),.*$', '\\1')
+              | reject('equalto', '_value')
+              | unique
+            )
+          }}
+      loop: "{{ fields_resp.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+

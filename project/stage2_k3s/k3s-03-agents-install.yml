@@ -1,9 +1,17 @@
+######################################
+# Created by : Meir
+# Purpose    : Install k3s agents with robust HTTPS preflight (avoid IPv6 stalls)
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
-# Install k3s AGENTS only
 - name: Install k3s agents
   hosts: k3s_workers
   become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
   vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"  # force key
     # derive server IP from the first host in k3s_server
     k3s_server_ip: "{{ hostvars[groups['k3s_server'][0]].ansible_host | default(groups['k3s_server'][0]) }}"
     k3s_server_host: "{{ groups['k3s_server'][0] }}"
@@ -16,7 +24,7 @@
     - import_tasks: k3s-99-utils.yml
 
     - name: Verify server token exists
-      stat:
+      ansible.builtin.stat:
         path: /var/lib/rancher/k3s/server/node-token
       delegate_to: "{{ k3s_server_host }}"
       become: yes
@@ -24,7 +32,7 @@
       run_once: true
 
     - name: Fail with hint if server not installed yet
-      fail:
+      ansible.builtin.fail:
         msg: >
           Node token not found on {{ k3s_server_host }}.
           Install k3s server first, then re-run.
@@ -33,7 +41,7 @@
       run_once: true
 
     - name: Read server node-token (once)
-      slurp:
+      ansible.builtin.slurp:
         src: /var/lib/rancher/k3s/server/node-token
       delegate_to: "{{ k3s_server_host }}"
       become: yes
@@ -41,43 +49,65 @@
       run_once: true
 
     - name: Decode join token (controller-side fact)
-      set_fact:
+      ansible.builtin.set_fact:
         k3s_join_token: "{{ node_token_raw.content | b64decode | trim }}"
       run_once: true
 
   tasks:
     - name: Ensure config dir
-      file:
+      ansible.builtin.file:
         path: /etc/rancher/k3s
         state: directory
         mode: "0755"
 
     - name: Write join token file on worker
-      copy:
+      ansible.builtin.copy:
         dest: /etc/rancher/k3s/node-token
         mode: "0600"
         content: "{{ k3s_join_token }}"
 
     - name: Write /etc/rancher/k3s/config.yaml (no token here)
-      copy:
+      ansible.builtin.copy:
         dest: /etc/rancher/k3s/config.yaml
         mode: "0644"
         content: |
           server: https://{{ k3s_server_ip }}:6443
           node-name: "{{ inventory_hostname | lower }}"
 
-    - name: Check HTTPS connectivity to get.k3s.io (agent, with retries)
-      command: curl -sS --head https://get.k3s.io
+    # Harden TLS prerequisites to avoid mysterious stalls
+    - name: Ensure CA certificates present (TLS trust)
+      ansible.builtin.package:
+        name: ca-certificates
+        state: present
+
+    - name: Ensure time sync is active (TLS validity)
+      ansible.builtin.systemd:
+        name: systemd-timesyncd
+        state: started
+        enabled: yes
+
+    - name: DNS resolve get.k3s.io (fail fast if resolver broken)
+      ansible.builtin.command: getent hosts get.k3s.io
+      register: dns_getk3s
+      changed_when: false
+      failed_when: dns_getk3s.rc != 0
+
+    # FIX: Force IPv4 + hard timeouts so it never hangs
+    - name: Check HTTPS connectivity to get.k3s.io (agent, with retries, no hang)
+      ansible.builtin.command: >
+        curl -I -4 --fail --show-error --location
+        --connect-timeout 5 --max-time 10
+        https://get.k3s.io
       register: https_check
       changed_when: false
       retries: 5
       delay: 5
       until: https_check.rc == 0
 
-    - name: Run k3s agent installer (async)
-      shell: |
+    - name: Run k3s agent installer (async, IPv4 + timeouts)
+      ansible.builtin.shell: |
         set -e
-        curl -sfL https://get.k3s.io | \
+        curl -sfL -4 --connect-timeout 5 --max-time 60 https://get.k3s.io | \
           INSTALL_K3S_TYPE=agent \
           K3S_URL=https://{{ k3s_server_ip }}:6443 \
           K3S_TOKEN_FILE=/etc/rancher/k3s/node-token \
@@ -89,12 +119,12 @@
       register: k3s_install
 
     - name: Confirm k3s-agent unit file exists
-      stat:
+      ansible.builtin.stat:
         path: /etc/systemd/system/k3s-agent.service
       register: agent_unit_stat
 
     - name: Fail if k3s-agent unit missing (show installer output)
-      fail:
+      ansible.builtin.fail:
         msg: |
           k3s agent did not install a systemd unit.
           --- installer stdout ---
@@ -104,7 +134,7 @@
       when: not agent_unit_stat.stat.exists
 
     - name: Start and enable k3s-agent
-      systemd:
+      ansible.builtin.systemd:
         name: k3s-agent
         state: started
         enabled: yes

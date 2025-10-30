@@ -1,0 +1,90 @@
+######################################
+# Created by : Meir
+# Purpose    : Common preflight for all k3s plays (baseline, safe, idempotent)
+# Date       : 2025-10-30
+# Version    : 2
+######################################
+---
+# IMPORT THIS FILE, DO NOT RUN DIRECTLY
+# pre_tasks:
+#   - import_tasks: "{{ playbook_dir }}/k3s-prepare.yml"
+
+- name: Ensure base tools are present (curl, CA, iproute2)
+  ansible.builtin.package:
+    name:
+      - curl
+      - ca-certificates
+      - iproute2
+    state: present
+  become: yes
+
+- name: Ensure /etc/rancher/k3s exists
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: yes
+
+- name: Ensure /var/lib/rancher/k3s exists
+  ansible.builtin.file:
+    path: /var/lib/rancher/k3s
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: yes
+
+- name: Ensure br_netfilter module is present
+  ansible.builtin.modprobe:
+    name: br_netfilter
+    state: present
+  become: yes
+  when: ansible_os_family in ['Debian','RedHat']
+
+# Persist and apply required sysctls
+- name: Enable bridge nf iptables (IPv4)
+  ansible.posix.sysctl:
+    name: net.bridge.bridge-nf-call-iptables
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-k8s.conf
+  become: yes
+
+- name: Enable bridge nf iptables (IPv6)
+  ansible.posix.sysctl:
+    name: net.bridge.bridge-nf-call-ip6tables
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-k8s.conf
+  become: yes
+
+- name: Ensure IPv4 forwarding is enabled
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-k8s.conf
+  become: yes
+
+- name: Disable swap immediately if enabled
+  ansible.builtin.command: swapoff -a
+  become: yes
+  when: (ansible_swaptotal_mb | default(0)) | int > 0
+  changed_when: false
+
+- name: Ensure swap is disabled on boot (comment out active swap entries)
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^\s*([^#]\S+\s+\S+\s+swap\s+.*)$'
+    line: '# \1'
+    backrefs: yes
+  become: yes
+

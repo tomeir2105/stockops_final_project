@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Deploy the "news" app on k3s with NFS-backed storage; add SSH public key via ConfigMap (from vars.yml controller_pubkey_line or CONTROLLER_PUBKEY_PATH fallback); robust rollout wait & exec
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 # Play 1: Normalize registries (public pull, no DockerHub auth)
 - name: Normalize registries on all k3s nodes (remove docker.io auth)
@@ -37,8 +43,7 @@
         state: restarted
       when: "'k3s_workers' in group_names"
 
-
-# Play 2: Deploy news as a Deployment (no Docker build)
+# Play 2: Deploy news as a Deployment (no Docker build) + SSH pubkey ConfigMap
 - name: Deploy news as a Deployment (no Docker build)
   hosts: k3s_server
   become: yes
@@ -84,6 +89,19 @@
       delegate_to: "{{ groups['nfs_server'][0] }}"
       become: yes
 
+    # --- SSH public key sourcing (vars.yml -> fallback to file) -----------------------
+    - name: Auto-load controller_pubkey_line from CONTROLLER_PUBKEY_PATH if missing
+      ansible.builtin.set_fact:
+        controller_pubkey_line: "{{ lookup('file', CONTROLLER_PUBKEY_PATH) | trim }}"
+      when: controller_pubkey_line is not defined or controller_pubkey_line | length == 0
+
+    - name: Ensure controller_pubkey_line is available
+      ansible.builtin.assert:
+        that:
+          - controller_pubkey_line is defined
+          - controller_pubkey_line | length > 0
+        fail_msg: "controller_pubkey_line not provided and could not be loaded from CONTROLLER_PUBKEY_PATH"
+
   tasks:
     - name: Ensure namespace exists
       kubernetes.core.k8s:
@@ -93,6 +111,19 @@
           kind: Namespace
           metadata:
             name: "{{ NAMESPACE }}"
+
+    - name: Create ConfigMap with controller_pubkey_line (SSH pubkey)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: controller-pubkey
+            namespace: "{{ NAMESPACE }}"
+          data:
+            authorized_keys: "{{ controller_pubkey_line }}"
+            note.txt: "Sourced from vars.yml or loaded from CONTROLLER_PUBKEY_PATH"
 
     - name: Create NFS PV for news
       kubernetes.core.k8s:
@@ -146,9 +177,9 @@
         kind: Deployment
         name: news
         namespace: "{{ NAMESPACE }}"
-      ignore_errors: yes
+      ignore_errors: true
 
-    - name: Create/Update news Deployment
+    - name: Create/Update news Deployment (image + SSH key mount outside NFS)
       kubernetes.core.k8s:
         state: present
         definition:
@@ -179,7 +210,7 @@
                 restartPolicy: Always
                 containers:
                   - name: news
-                    image: "python:3.12-slim"
+                    image: "python:3.12-slim"   # public image to avoid ImagePullBackOff
                     imagePullPolicy: IfNotPresent
                     env:
                       - name: HOME
@@ -195,22 +226,14 @@
                       - name: NEWS_POLL_SECONDS
                         value: "{{ NEWS_POLL_SECONDS }}"
                       - name: NEWS_TICKERS
-                        value: "AAPL,MSFT,GOOGL"
-                      - name: TICKERS
-                        value: "$(NEWS_TICKERS)"        # expand from NEWS_TICKERS at runtime
-                      - name: NEWS_FILTER_REQUIRE_TICKER
-                        value: "false"                  # allow company-name matches
-                      - name: NEWS_BACKFILL_ON_START
-                        value: "true"                   # backfill on every start
-                      - name: NEWS_BACKFILL_DAYS
-                        value: "7"                      # backfill window
+                        value: "{{ NEWS_TICKERS }}"
                     command: ["/bin/sh", "-lc"]
                     args:
-                      - >
+                      - |
                         if [ ! -d /app/.venv ]; then
                           python -m venv /app/.venv;
-                        fi &&
-                        /app/.venv/bin/pip install --no-cache-dir -r /app/requirements.txt &&
+                        fi
+                        /app/.venv/bin/pip install --no-cache-dir -r /app/requirements.txt
                         exec /app/.venv/bin/python -u /app/app.py
                     resources:
                       requests:
@@ -222,21 +245,86 @@
                     volumeMounts:
                       - name: data
                         mountPath: /app
+                      - name: controller-pubkey
+                        mountPath: /controller_key   # moved outside NFS to avoid root_squash issues
+                        readOnly: true
                 volumes:
                   - name: data
                     persistentVolumeClaim:
                       claimName: news-pvc
+                  - name: controller-pubkey
+                    configMap:
+                      name: controller-pubkey
+                      items:
+                        - key: authorized_keys
+                          path: authorized_keys
+                        - key: note.txt
+                          path: note.txt
 
-    - name: Verify /app directory permissions and contents in running news pod
-      ansible.builtin.shell: |
-        set -e
-        POD=$(kubectl -n {{ NAMESPACE }} get pod -l app=news -o jsonpath='{.items[0].metadata.name}')
-        echo "Checking pod: $POD"
-        kubectl -n {{ NAMESPACE }} exec "$POD" -- sh -lc 'id && ls -ld /app && ls -l /app || true'
-      register: news_ls_output
+    # --- Verification & Diagnostics (robust wait + dynamic container name) ---
+    - name: Wait for "news" Deployment to be Available
+      ansible.builtin.shell: >
+        {{ KUBECTL | default('kubectl') }} -n {{ NAMESPACE }}
+        rollout status deploy/news --timeout=180s
+      register: rollout_status
       changed_when: false
 
-    - name: Print /app permissions from news pod
-      ansible.builtin.debug:
-        msg: "{{ news_ls_output.stdout_lines }}"
+    - name: Wait for a Ready news pod
+      ansible.builtin.shell: >
+        {{ KUBECTL | default('kubectl') }} -n {{ NAMESPACE }}
+        wait --for=condition=ready pod -l app=news --timeout=180s
+      register: wait_ready
+      changed_when: false
+
+    - name: Get news pod name
+      ansible.builtin.shell: >
+        {{ KUBECTL | default('kubectl') }} -n {{ NAMESPACE }}
+        get pod -l app=news -o jsonpath='{.items[0].metadata.name}'
+      register: news_pod
+      changed_when: false
+
+    - name: Get container name from pod spec (avoid hard-coding)
+      ansible.builtin.shell: >
+        {{ KUBECTL | default('kubectl') }} -n {{ NAMESPACE }}
+        get pod {{ news_pod.stdout }} -o jsonpath='{.spec.containers[0].name}'
+      register: news_container
+      changed_when: false
+
+    - name: Exec into container and list /app
+      block:
+        - ansible.builtin.shell: >
+            {{ KUBECTL | default('kubectl') }} -n {{ NAMESPACE }}
+            exec {{ news_pod.stdout }} -c {{ news_container.stdout }} -- sh -lc
+            'id && ls -ld /app && ls -l /app && ls -l /controller_key || true'
+          register: news_ls_output
+          changed_when: false
+          retries: 3
+          delay: 5
+          until: news_ls_output.rc == 0
+
+        - ansible.builtin.debug:
+            msg: "{{ news_ls_output.stdout_lines | default([]) }}"
+      rescue:
+        - name: Describe pod on failure
+          ansible.builtin.shell: >
+            {{ KUBECTL | default('kubectl') }} -n {{ NAMESPACE }}
+            describe pod {{ news_pod.stdout }}
+          register: news_describe
+          changed_when: false
+          failed_when: false
+
+        - name: Show last 200 lines of container logs (first container)
+          ansible.builtin.shell: >
+            {{ KUBECTL | default('kubectl') }} -n {{ NAMESPACE }}
+            logs {{ news_pod.stdout }} -c {{ news_container.stdout }} --tail=200
+          register: news_logs
+          changed_when: false
+          failed_when: false
+
+        - ansible.builtin.debug:
+            msg:
+              - "===== describe pod ====="
+              - "{{ news_describe.stdout | default('') }}"
+              - "===== logs (tail) ====="
+              - "{{ news_logs.stdout | default('') }}"
 

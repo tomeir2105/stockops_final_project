@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Cleanup Observability & Jenkins resources (keeps PV data) on k3s
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 - name: "Cleanup Observability & Jenkins resources (keep PV data)"
   hosts: k3s_server
@@ -7,11 +13,18 @@
     - "{{ playbook_dir }}/../vars.yml"
 
   vars:
+    # Ensure the correct SSH key is used for all target nodes
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
+
     ns: "{{ NAMESPACE | default('observability') }}"
     pv_names:
       - grafana-pv
       - influxdb-pv
       - jenkins-pv
+
+  environment:
+    # Use your kubeconfig from vars.yml on the remote host
+    KUBECONFIG: "{{ KUBECONFIG }}"
 
   tasks:
     - name: "Detect kubectl (prefer kubectl, else k3s kubectl)"
@@ -89,61 +102,5 @@
           register: pvc_delete
           failed_when: false
 
-        - name: "Wait briefly after PVC delete"
-          pause:
-            seconds: 4
-      when: ns_check.rc == 0
-
-    # ---------------- PV RESET (so future apply binds cleanly) ----------------
-    - name: "Get PV phases (if they exist)"
-      shell: |
-        {{ kubectl_cmd.stdout }} get pv {{ item }} -o jsonpath='{.status.phase}' 2>/dev/null || echo NotFound
-      args: { executable: /bin/bash }
-      loop: "{{ pv_names }}"
-      register: pv_phase_results
-      changed_when: false
-
-    - name: "Delete stale PVs (Bound/Released/Failed) — data stays on NFS"
-      shell: |
-        {{ kubectl_cmd.stdout }} patch pv {{ item.item }} -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null 2>&1 || true
-        {{ kubectl_cmd.stdout }} delete pv {{ item.item }} --wait=false || true
-      args: { executable: /bin/bash }
-      loop: "{{ pv_phase_results.results }}"
-      when: item.stdout in ["Bound", "Released", "Failed"]
-      changed_when: true
-
-    - name: "Force-remove PV finalizers if deletion is stuck"
-      shell: |
-        if {{ kubectl_cmd.stdout }} get pv {{ item }} >/dev/null 2>&1; then
-          {{ kubectl_cmd.stdout }} patch pv {{ item }} --type=merge -p '{"metadata":{"finalizers":[]}}' || true
-        fi
-      args: { executable: /bin/bash }
-      loop: "{{ pv_names }}"
-      changed_when: false
-      failed_when: false
-
-    - name: "Wait for PV deletions to complete (up to 60s)"
-      shell: |
-        for i in $(seq 1 12); do
-          missing=0
-          for pv in {{ pv_names | join(' ') }}; do
-            if ! {{ kubectl_cmd.stdout }} get pv $pv >/dev/null 2>&1; then
-              missing=$((missing+1))
-            fi
-          done
-          if [ "$missing" -eq {{ pv_names | length }} ]; then
-            exit 0
-          fi
-          sleep 5
-        done
-        exit 1
-      args: { executable: /bin/bash }
-      register: pv_wait
-      changed_when: false
-      failed_when: pv_wait.rc != 0
-
-    - name: "Summary"
-      debug:
-        msg:
-          - "Cleanup complete for namespace {{ ns }}."
+        - name: "Wait briefly after
 

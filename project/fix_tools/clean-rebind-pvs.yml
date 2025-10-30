@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Clean & rebind NFS PVs to desired PVCs (runs kubectl on controller/router)
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 - name: Clean & rebind NFS PVs to current PVCs
   hosts: k3srouter_host
@@ -6,9 +12,10 @@
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
 
-  # Map PVs to the PVCs you want them bound to.
-  # Adjust/add pairs as needed.
+  # Force Ansible to use the controller SSH key for this host
   vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
+    # Map PVs to the PVCs you want them bound to. Adjust/add pairs as needed.
     NAMESPACE: "{{ lookup('vars', 'K8S_NAMESPACE') | default('stockops') }}"
     PV_PVC_MAP:
       - { pv: grafana-pv,  pvc: grafana-pvc }

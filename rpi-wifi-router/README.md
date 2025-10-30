@@ -4,6 +4,8 @@
 This project automates the setup of a Raspberry Pi as a full Wi‑Fi router / access point running Debian 13 (trixie).  
 It configures the network interfaces, access point, DHCP/DNS server, NAT, and persistence — all through staged, idempotent Bash scripts.
 
+## Important
+First update the wan interface in .env
 ## Features
 - Modular staged installer (0 → 6)
 - Automatic OS and kernel validation

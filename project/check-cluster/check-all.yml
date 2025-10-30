@@ -22,3 +22,5 @@
 - import_playbook: check-pods.yml
   tags: [pods]
 
+- import_playbook: check-influxdb.yml
+  tags: [buckets]

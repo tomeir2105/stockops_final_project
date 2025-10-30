@@ -7,8 +7,8 @@
     - "{{ playbook_dir }}/../vars.yml"
 
   vars:
-    ns: "{{ NAMESPACE | default(K8S_NAMESPACE) | default('default') }}"
-    NODE_IP: "{{ NODE_IP | default(ansible_host) | default('192.168.50.101') }}"
+    ns: "{{ NAMESPACE }}"
+    NODE_IP: "{{ NODE_IP }}"
 
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
@@ -27,9 +27,11 @@
         g=$($k -n {{ ns }} get svc grafana -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || $k -n {{ ns }} get svc grafana-nodeport -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
         i=$($k -n {{ ns }} get svc influxdb -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || $k -n {{ ns }} get svc influxdb-nodeport -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
         j=$($k -n {{ ns }} get svc jenkins-nodeport -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || $k -n {{ ns }} get svc jenkins -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
+        f=$($k -n {{ ns }} get svc finbert-svc -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || $k -n {{ ns }} get svc jenkins -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
         echo "Grafana → http://{{ NODE_IP }}:$g"
         echo "InfluxDB → http://{{ NODE_IP }}:$i"
         echo "Jenkins → http://{{ NODE_IP }}:$j"
+        echo "Finbert → http://{{ NODE_IP }}:$f"
       args: { executable: /bin/bash }
       register: urls
       changed_when: false

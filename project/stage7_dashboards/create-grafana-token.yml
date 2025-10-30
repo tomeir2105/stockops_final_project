@@ -1,50 +1,97 @@
+######################################
+# Created by : Meir
+# Purpose    : Create (or renew) a Grafana API token and also load the controller's public SSH key from vars.yml
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
-# create-grafana-token.yml
-# Creates or renews a Grafana API token and prints it.
-
 - name: Create Grafana API token
   hosts: localhost
   gather_facts: false
+
   vars_files:
-    - "{{ playbook_dir }}/../vars.yml"
+    - "{{ playbook_dir }}/../vars.yml"   # Load all required variables from the central vars file
 
   vars:
-    grafana_api_url: "{{ GRAFANA_URL | regex_replace('/+$', '') }}/api/auth/keys"
+    # Normalize Grafana API URL (strip trailing slash) and form the auth/keys endpoint
+    grafana_api_url: "{{ (GRAFANA_URL | regex_replace('/+$', '')) }}/api/auth/keys"
     grafana_user: "{{ GRAFANA_ADMIN_USER }}"
     grafana_pass: "{{ GRAFANA_ADMIN_PASSWORD }}"
     token_name: "ansible-token"
+    # Allow TLS verification to be controlled from vars.yml (defaults to false if not provided)
+    grafana_validate_certs: "{{ (GRAFANA_VALIDATE_CERTS | default(false)) | bool }}"
+
+  pre_tasks:
+    - name: Assert required Grafana variables exist
+      ansible.builtin.assert:
+        that:
+          - GRAFANA_URL is defined and (GRAFANA_URL | trim) | length > 0
+          - GRAFANA_ADMIN_USER is defined and (GRAFANA_ADMIN_USER | trim) | length > 0
+          - GRAFANA_ADMIN_PASSWORD is defined and (GRAFANA_ADMIN_PASSWORD | trim) | length > 0
+        fail_msg: "Missing one of: GRAFANA_URL, GRAFANA_ADMIN_USER, GRAFANA_ADMIN_PASSWORD in vars.yml."
+      # Purpose: Fail fast if core variables are missing
+
+    - name: Assert controller public key reference exists (either content or path)
+      ansible.builtin.assert:
+        that:
+          - (CONTROLLER_PUB_KEY is defined and (CONTROLLER_PUB_KEY | trim) | length > 0)
+            or
+          - (CONTROLLER_PUB_KEY_PATH is defined and (CONTROLLER_PUB_KEY_PATH | trim) | length > 0)
+        fail_msg: "Provide CONTROLLER_PUB_KEY (content) or CONTROLLER_PUB_KEY_PATH (file path) in vars.yml."
+      # Purpose: Ensure we have a public key reference available
+
+    - name: Load controller public key (prefer inline content, else read from file path)
+      ansible.builtin.set_fact:
+        controller_pub_key: >-
+          {{
+            (CONTROLLER_PUB_KEY | trim)
+              if (CONTROLLER_PUB_KEY is defined and (CONTROLLER_PUB_KEY | trim) | length > 0)
+              else (lookup('file', CONTROLLER_PUB_KEY_PATH) | trim)
+          }}
+        controller_pub_key_source: >-
+          {{
+            'vars.yml (CONTROLLER_PUB_KEY)'
+              if (CONTROLLER_PUB_KEY is defined and (CONTROLLER_PUB_KEY | trim) | length > 0)
+              else 'file: ' ~ CONTROLLER_PUB_KEY_PATH
+          }}
+      # Purpose: Resolve the actual public key content we will reference later if needed
+
+    - name: Show target Grafana instance and pubkey source (no secrets)
+      ansible.builtin.debug:
+        msg:
+          - "Creating token '{{ token_name }}' on {{ grafana_api_url | regex_replace('/api/auth/keys','') }}"
+          - "Controller public key loaded from: {{ controller_pub_key_source }}"
+      # Purpose: Provide visibility into which endpoint and key source are used (does not print key value)
 
   tasks:
-    - name: Show target Grafana instance
-      debug:
-        msg: "Creating token '{{ token_name }}' on {{ grafana_api_url | regex_replace('/api/auth/keys','') }}"
-
-    - name: Try deleting existing token with same name (ignore errors)
-      uri:
+    - name: Try listing existing tokens (ignore errors)
+      ansible.builtin.uri:
         url: "{{ grafana_api_url }}"
         method: GET
         user: "{{ grafana_user }}"
         password: "{{ grafana_pass }}"
         force_basic_auth: true
         status_code: 200
-        validate_certs: false
+        validate_certs: "{{ grafana_validate_certs }}"
       register: existing_tokens
       failed_when: false
+      # Purpose: Fetch current tokens so we can delete a previous one with the same name
 
     - name: Remove old token if it exists
-      uri:
+      ansible.builtin.uri:
         url: "{{ grafana_api_url }}/{{ item.id }}"
         method: DELETE
         user: "{{ grafana_user }}"
         password: "{{ grafana_pass }}"
         force_basic_auth: true
-        status_code: [200,404]
-        validate_certs: false
-      loop: "{{ existing_tokens.json | default([]) | selectattr('name','equalto',token_name) | list }}"
+        status_code: [200, 404]
+        validate_certs: "{{ grafana_validate_certs }}"
+      loop: "{{ existing_tokens.json | default([]) | selectattr('name','equalto', token_name) | list }}"
       when: existing_tokens.json is defined
+      # Purpose: Ensure idempotency—delete any prior token with the same name
 
     - name: Create new Grafana API token
-      uri:
+      ansible.builtin.uri:
         url: "{{ grafana_api_url }}"
         method: POST
         user: "{{ grafana_user }}"
@@ -57,10 +104,12 @@
           secondsToLive: 0          # never expires
         status_code: 200
         return_content: true
-        validate_certs: false
+        validate_certs: "{{ grafana_validate_certs }}"
       register: new_token
+      # Purpose: Create the token and capture the returned key
 
-    - name: Print the new token
-      debug:
+    - name: Print the new token (stdout)
+      ansible.builtin.debug:
         msg: "Grafana API token: {{ new_token.json.key }}"
+      # Purpose: Output the token value for immediate use (keep it safe)
 

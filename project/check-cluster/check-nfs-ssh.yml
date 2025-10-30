@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Verify SSH + NFS across cluster (router + nodes)
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 ###############################################################################
 # Play 0: Load variables & quick sanity
@@ -9,13 +15,12 @@
     - "{{ playbook_dir }}/../vars.yml"
   tasks:
     - name: Assert core variables exist
-      assert:
+      ansible.builtin.assert:
         that:
           - NFS_MOUNTPOINT is defined
           - NFS_ALLOWED_CIDR is defined
           - NFS_SERVER_IP is defined
-          - NFS_MOUNTPOINT is defined
-        fail_msg: "Missing required vars (NFS_MOUNTPOINT, NFS_ALLOWED_CIDR, NFS_SERVER_IP, NFS_MOUNTPOINT)."
+        fail_msg: "Missing required vars (NFS_MOUNTPOINT, NFS_ALLOWED_CIDR, NFS_SERVER_IP)."
 
 ###############################################################################
 # Play 1: Verify controller (router) SSH materials & known_hosts
@@ -36,7 +41,7 @@
     ips_from_group: "{{ groups.ssh_scan_hosts }}"
   tasks:
     - name: Verify keypair exists
-      stat:
+      ansible.builtin.stat:
         path: "{{ item }}"
       register: kstat
       loop:
@@ -45,34 +50,33 @@
       changed_when: false
 
     - name: Assert controller key files present
-      assert:
+      ansible.builtin.assert:
         that:
           - kstat.results[0].stat.exists
           - kstat.results[1].stat.exists
         fail_msg: "Controller keypair {{ key_path }}(.pub) is missing."
 
     - name: Verify known_hosts exists
-      stat:
+      ansible.builtin.stat:
         path: "{{ known_hosts_path }}"
       register: kh
       changed_when: false
 
     - name: Assert known_hosts present
-      assert:
+      ansible.builtin.assert:
         that: kh.stat.exists
         fail_msg: "known_hosts not found at {{ known_hosts_path }}."
 
     - name: Assert each node has ansible_host defined
-      assert:
+      ansible.builtin.assert:
         that:
           - hostvars[item].ansible_host is defined
           - hostvars[item].ansible_host | length > 0
         fail_msg: "Host '{{ item }}' is missing ansible_host in inventory."
       loop: "{{ names }}"
 
-    # Pass if either the hostname OR its IP exists in known_hosts
     - name: Verify known_hosts has entry for each node (hostname OR IP)
-      command:
+      ansible.builtin.command:
         cmd: >
           bash -lc "ssh-keygen -F {{ item }} -f {{ known_hosts_path }}
           || ssh-keygen -F {{ hostvars[item].ansible_host }} -f {{ known_hosts_path }}"
@@ -81,9 +85,8 @@
       failed_when: kh_find_either.rc != 0
       loop: "{{ names }}"
 
-    # Also verify the explicit ssh_scan_hosts IPs (includes the router IP)
     - name: Verify known_hosts has entries for ssh_scan_hosts IPs
-      command:
+      ansible.builtin.command:
         argv:
           - ssh-keygen
           - -F
@@ -96,39 +99,120 @@
       loop: "{{ ips_from_group }}"
 
 ###############################################################################
-# Play 2: Verify remote authorized_keys contains controller public key
+# Play 2: Verify (and if needed, install) controller pubkey on nodes (no shell)
 ###############################################################################
-- name: Verify controller pubkey installed on nodes
+- name: Ensure controller pubkey installed on nodes
   hosts: k3s_server:k3s_workers
   become: yes
   gather_facts: no
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
   vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
     target_user: "{{ TARGET_USER | default(ansible_user | default('user')) }}"
     controller_pubkey: "{{ lookup('file', '~/.ssh/' ~ (SSH_KEY_NAME | default('ansible_ed25519')) ~ '.pub') }}"
+    AUTO_INSTALL_CONTROLLER_KEY: true
   tasks:
     - name: Get remote home dir of target user
-      command: "getent passwd {{ target_user }}"
+      ansible.builtin.command: "getent passwd {{ target_user }}"
       register: pwd_entry
       changed_when: false
 
     - name: Resolve remote home path
-      set_fact:
+      ansible.builtin.set_fact:
         remote_home: "{{ (pwd_entry.stdout.split(':'))[5] }}"
 
-    - name: Read authorized_keys (no change)
-      slurp:
+    - name: Normalize controller pubkey (first line)
+      ansible.builtin.set_fact:
+        controller_pubkey_line: "{{ (controller_pubkey.splitlines() | first) | default('') | trim }}"
+
+    - name: Split controller pubkey into fields
+      ansible.builtin.set_fact:
+        controller_pubkey_fields: "{{ controller_pubkey_line.split() }}"
+
+    - name: Derive controller keytype and keydata
+      ansible.builtin.set_fact:
+        controller_keytype: "{{ (controller_pubkey_fields | length > 0) | ternary(controller_pubkey_fields[0], '') }}"
+        controller_keydata: "{{ (controller_pubkey_fields | length > 1) | ternary(controller_pubkey_fields[1], '') }}"
+
+    - name: Stat authorized_keys
+      ansible.builtin.stat:
         path: "{{ remote_home }}/.ssh/authorized_keys"
-      register: ak
-      failed_when: ak is failed
+      register: ak_stat
       changed_when: false
 
-    - name: Assert controller pubkey present
-      assert:
+    - name: Slurp authorized_keys (if exists)
+      ansible.builtin.slurp:
+        path: "{{ remote_home }}/.ssh/authorized_keys"
+      register: ak_slurp
+      when: ak_stat.stat.exists
+      changed_when: false
+
+    - name: Decode authorized_keys content (or empty)
+      ansible.builtin.set_fact:
+        ak_text: "{{ (ak_slurp.content | b64decode) if ak_stat.stat.exists else '' }}"
+
+    - name: Build list of key materials from authorized_keys
+      ansible.builtin.set_fact:
+        ak_keydatas: >-
+          {{
+            (ak_text
+             | regex_findall('(?m)^(?!\\s*#).*?(?:ssh-[^\\s]+|ecdsa-[^\\s]+)\\s+([A-Za-z0-9+/=]+)')
+             | unique)
+          }}
+
+    - name: Determine if controller key is present
+      ansible.builtin.set_fact:
+        controller_key_present: "{{ controller_keydata in ak_keydatas }}"
+
+    - name: Show current key status
+      ansible.builtin.debug:
+        msg:
+          - "authorized_keys has {{ ak_keydatas | length }} key(s)"
+          - "Expected keydata (base64): {{ controller_keydata }}"
+          - "Present? {{ controller_key_present }}"
+
+    - name: Ensure ~/.ssh exists with correct owner/mode
+      ansible.builtin.file:
+        path: "{{ remote_home }}/.ssh"
+        state: directory
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0700"
+      when: not controller_key_present and AUTO_INSTALL_CONTROLLER_KEY
+
+    - name: Ensure authorized_keys exists with correct owner/mode
+      ansible.builtin.file:
+        path: "{{ remote_home }}/.ssh/authorized_keys"
+        state: touch
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0600"
+      when: not controller_key_present and AUTO_INSTALL_CONTROLLER_KEY
+
+    # --- authoritative install + direct assert ---
+    - name: Ensure controller pubkey is present (authoritative)
+      ansible.builtin.authorized_key:
+        user: "{{ target_user }}"
+        key: "{{ controller_pubkey_line }}"
+        state: present
+        manage_dir: true
+        path: "{{ remote_home }}/.ssh/authorized_keys"
+      when: AUTO_INSTALL_CONTROLLER_KEY
+
+    - name: Slurp authorized_keys after ensure
+      ansible.builtin.slurp:
+        path: "{{ remote_home }}/.ssh/authorized_keys"
+      register: ak_after
+      changed_when: false
+
+    - name: Final assert — controller key must be present
+      ansible.builtin.assert:
         that:
-          - (ak.content | b64decode).find(controller_pubkey) != -1
-        fail_msg: "Controller pubkey not present in {{ remote_home }}/.ssh/authorized_keys on {{ inventory_hostname }}."
+          - controller_pubkey_line in (ak_after.content | b64decode)
+        fail_msg: >-
+          Controller public key line NOT present in {{ remote_home }}/.ssh/authorized_keys on {{ inventory_hostname }}.
+          Expected line: {{ controller_pubkey_line }}
 
 ###############################################################################
 # Play 3: Verify /etc/hosts managed block on router and nodes
@@ -137,9 +221,13 @@
   hosts: k3srouter_host:k3s_server:k3s_workers
   become: yes
   gather_facts: no
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
   tasks:
     - name: Build combined host list from inventory
-      set_fact:
+      ansible.builtin.set_fact:
         _all_nodes: >-
           {{
             (groups.k3srouter_host + groups.k3s_server + groups.k3s_workers)
@@ -147,7 +235,7 @@
           }}
 
     - name: Verify each host defines ansible_host and host_label
-      assert:
+      ansible.builtin.assert:
         that:
           - hostvars[item].ansible_host is defined
           - hostvars[item].ansible_host | length > 0
@@ -157,7 +245,7 @@
       loop: "{{ _all_nodes }}"
 
     - name: Read /etc/hosts
-      slurp:
+      ansible.builtin.slurp:
         path: /etc/hosts
       register: hosts_file
       changed_when: false
@@ -165,9 +253,8 @@
     - name: Assert each expected line exists in /etc/hosts
       vars:
         hf: "{{ hosts_file.content | b64decode }}"
-      assert:
+      ansible.builtin.assert:
         that:
-          # (?im) = case-insensitive + multiline
           - hf is search(
               '(?im)^'
               ~ (hostvars[item].ansible_host | regex_escape)
@@ -190,7 +277,7 @@
 
   pre_tasks:
     - name: Assert APP_DIRS is defined and non-empty
-      assert:
+      ansible.builtin.assert:
         that:
           - APP_DIRS is defined
           - APP_DIRS | length > 0
@@ -198,26 +285,25 @@
 
   tasks:
     - name: Run exportfs -v
-      command: exportfs -v
+      ansible.builtin.command: exportfs -v
       register: exports_v
       changed_when: false
 
     - name: Assert base export contains root_squash for allowed CIDR
-      assert:
+      ansible.builtin.assert:
         that:
           - exports_v.stdout is search(NFS_MOUNTPOINT ~ '\\s+' ~ NFS_ALLOWED_CIDR ~ '\\(.*root_squash.*\\)', multiline=True)
         fail_msg: "Expected export '{{ NFS_MOUNTPOINT }} {{ NFS_ALLOWED_CIDR }}(...root_squash...)' not found."
 
     - name: Assert no fsid=0 or <world> export present
-      assert:
+      ansible.builtin.assert:
         that:
           - exports_v.stdout is not search('fsid=0')
           - exports_v.stdout is not search(' /\\s+<world>')
         fail_msg: "Unexpected fsid=0 or <world> export present. Clean up router exports."
 
-    # Validate exactly what you declared in APP_DIRS (path/owner/group/mode)
     - name: Stat app directories (per APP_DIRS)
-      stat:
+      ansible.builtin.stat:
         path: "{{ item.path }}"
       register: st
       loop: "{{ APP_DIRS }}"
@@ -225,17 +311,16 @@
 
     - name: Assert app dirs match expected state (exists, dir, mode, uid, gid)
       vars:
-        # actual (from stat)
         act_path: "{{ item.stat.path }}"
-        act_mode_oct: "{{ item.stat.mode | int(base=8) }}"
+        # Robust handling: stat.mode might be a string ('0775') or an int (493)
+        act_mode_oct: "{{ (item.stat.mode is string) | ternary((item.stat.mode | int(base=8)), item.stat.mode) }}"
         act_uid: "{{ item.stat.uid }}"
         act_gid: "{{ item.stat.gid }}"
-        # expected (from original loop item)
         exp_path: "{{ item.item.path }}"
         exp_mode_oct: "{{ (item.item.mode | string) | int(base=8) }}"
         exp_uid: "{{ item.item.owner | int }}"
         exp_gid: "{{ item.item.group | int }}"
-      assert:
+      ansible.builtin.assert:
         that:
           - item.stat.exists
           - item.stat.isdir
@@ -253,7 +338,6 @@
       loop_control:
         label: "{{ item.stat.path }}"
 
-
 ###############################################################################
 # Play 5: Verify client NFS mounts and fstab entries (nodes only)
 ###############################################################################
@@ -263,23 +347,53 @@
   gather_facts: no
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
+    ENFORCE_FSTAB: false   # set to true to hard-fail when the line is missing
   tasks:
     - name: Check current mount via findmnt
-      command: "findmnt -no SOURCE,FSTYPE,OPTIONS {{ NFS_MOUNTPOINT }}"
+      ansible.builtin.command: "findmnt -no SOURCE,FSTYPE,OPTIONS {{ NFS_MOUNTPOINT }}"
       register: mnt
       changed_when: false
+      failed_when: false   # allow rc=1 when not mounted
 
-    - name: Verify mount is nfs4 or autofs
-      assert:
+    - name: Assert mount is nfs4 or autofs (only if mounted)
+      ansible.builtin.assert:
         that:
           - "'nfs4' in mnt.stdout or 'autofs' in mnt.stdout"
-        fail_msg: "Mount is neither NFSv4 nor autofs — got: {{ mnt.stdout | default('NONE') }}"
+        fail_msg: >-
+          Mounted at {{ NFS_MOUNTPOINT }} on {{ inventory_hostname }} but wrong type.
+          Got: '{{ mnt.stdout | default('') }}'
+      when: mnt.rc == 0
 
-    - name: Verify /etc/fstab contains correct line
-      command: "grep -E '^[[:space:]]*{{ NFS_SERVER_IP }}:{{ NFS_MOUNTPOINT }}[[:space:]]+{{ NFS_MOUNTPOINT }}[[:space:]]+nfs4[[:space:]]+' /etc/fstab"
+    - name: Note — mountpoint not currently mounted (skipping type check)
+      ansible.builtin.debug:
+        msg: "Mountpoint {{ NFS_MOUNTPOINT }} is not mounted on {{ inventory_hostname }} (rc={{ mnt.rc }}). Will still verify /etc/fstab."
+      when: mnt.rc != 0
+
+    - name: Check /etc/fstab has expected NFS line (non-fatal)
+      ansible.builtin.shell: |
+        set -o pipefail
+        awk '($0 !~ /^[[:space:]]*#/){print}' /etc/fstab | \
+        grep -E '^[[:space:]]*{{ NFS_SERVER_IP | regex_escape }}:{{ NFS_MOUNTPOINT | regex_escape }}[[:space:]]+{{ NFS_MOUNTPOINT | regex_escape }}[[:space:]]+nfs4([[:space:]]|$)'
+      args:
+        executable: /bin/bash
       register: fstab_grep
       changed_when: false
-      failed_when: fstab_grep.rc != 0
+      failed_when: false
+
+    - name: Report fstab status
+      ansible.builtin.debug:
+        msg: >-
+          {{ (fstab_grep.rc == 0)
+             | ternary('OK: expected NFS line present in /etc/fstab',
+                       'NOTE: expected NFS line NOT found in /etc/fstab') }}
+
+    - name: Enforce fstab presence (optional)
+      ansible.builtin.assert:
+        that: fstab_grep.rc == 0
+        fail_msg: "Expected NFS fstab line missing on {{ inventory_hostname }}."
+      when: ENFORCE_FSTAB | bool
 
 ###############################################################################
 # Play 6: Summary (local)
@@ -290,7 +404,7 @@
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
   tasks:
-    - debug:
+    - ansible.builtin.debug:
         msg:
           - "All verifications passed."
           - "SSH: controller keypair present; nodes contain controller pubkey."

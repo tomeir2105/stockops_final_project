@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Audit stockops ownership, modes, and ACLs (read-only)
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 - name: Audit stockops ownership, modes, and ACLs (read-only)
   hosts: k3srouter_host
@@ -67,7 +73,7 @@
           - "DIR: {{ item.invocation.module_args.path }}"
           - "exists: false"
       loop: "{{ dir_stats.results }}"
-      when: not (item.stat.exists | bool)
+      when: not (item.stat.exists | default(false))
 
     # -------------------------------------------------------------
     # .env files
@@ -81,20 +87,31 @@
     - name: Show .env ownership/mode (missing files are ok)
       ansible.builtin.debug:
         msg:
-          - "FILE: {{ item.stat.exists | bool | ternary(item.stat.path, item.invocation.module_args.path) }}"
-          - "exists: {{ item.stat.exists }}"
+          - "FILE: {{ item.stat.path if (item.stat.exists | default(false)) else item.invocation.module_args.path }}"
+          - "exists: {{ item.stat.exists | default(false) }}"
           - >-
             owner: {{
-              (item.stat.pw_name
-                | default(uid_to_name[item.stat.uid | string]
-                | default(item.stat.uid)))
+              (
+                item.stat.pw_name
+                | default(uid_to_name[item.stat.uid | string] | default(item.stat.uid))
+              )
+              if (item.stat.exists | default(false)) else 'n/a'
             }}
             group: {{
-              (item.stat.gr_name
-                | default(gid_to_name[item.stat.gid | string]
-                | default(item.stat.gid)))
+              (
+                item.stat.gr_name
+                | default(gid_to_name[item.stat.gid | string] | default(item.stat.gid))
+              )
+              if (item.stat.exists | default(false)) else 'n/a'
             }}
-            mode(octal): {{ item.stat.exists | bool | ternary(item.stat.mode, 'n/a') }}
+            mode(octal): {{
+              (
+                '%04o' % (
+                  (item.stat.mode | int(base=8)) if (item.stat.mode is string) else item.stat.mode
+                )
+              )
+              if (item.stat.exists | default(false)) else 'n/a'
+            }}
       loop: "{{ env_stats.results }}"
 
     # -------------------------------------------------------------
@@ -103,7 +120,7 @@
     - name: Read ACLs with getfacl (existing dirs only)
       ansible.builtin.command: "getfacl -p {{ item.stat.path }}"
       loop: "{{ dir_stats.results }}"
-      when: item.stat.exists | bool
+      when: item.stat.exists | default(false)
       register: facl_out
       changed_when: false
       failed_when: false

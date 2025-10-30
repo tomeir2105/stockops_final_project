@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Deploy Grafana & InfluxDB on k3s with NFS-backed PVs (observability stack)
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 # deploy-03-observability-deploy.yml — Deploy Grafana & InfluxDB on k3s with NFS storage
 
@@ -9,10 +15,16 @@
     - "{{ playbook_dir }}/../vars.yml"
 
   vars:
+    # Ensure Ansible uses your controller SSH key
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
     ns: "{{ NAMESPACE }}"
     nfs_server_ip: "{{ NFS_SERVER_IP }}"
     influx_pv_path: "{{ NFS_MOUNTPOINT }}/influxdb"
     grafana_pv_path: "{{ NFS_MOUNTPOINT }}/grafana"
+
+  environment:
+    # Use your kubeconfig from vars.yml for all kubectl operations
+    KUBECONFIG: "{{ KUBECONFIG }}"
 
   tasks:
     - name: Ensure namespace exists (idempotent)

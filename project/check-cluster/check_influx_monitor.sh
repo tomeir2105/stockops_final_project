@@ -1,29 +1,51 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+######################################
+# Created by : Meir
+# Purpose    : Check recent CPU/RAM data written into InfluxDB (CSV preview)
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 
-# -----------------------------------------------------------------------------
-# Check recent data written by Jenkins pipelines into InfluxDB (CPU & RAM)
-# -----------------------------------------------------------------------------
+set -Eeuo pipefail
 
-# === CONFIGURATION ===
-INFLUX_URL="http://influxdb.stockops.svc.cluster.local:8086"
-INFLUX_ORG="monitor"
-INFLUX_BUCKET="netdata_2h"
-INFLUX_TOKEN="${INFLUX_TOKEN:-}"  # can be passed via environment or Jenkins secret
+# --- CONFIGURATION (override via env if needed) --------------------------------
+INFLUX_URL="${INFLUX_URL:-http://influxdb.stockops.svc.cluster.local:8086}"
+INFLUX_ORG="${INFLUX_ORG:-monitor}"
+INFLUX_BUCKET="${INFLUX_BUCKET:-netdata_2h}"
+INFLUX_TOKEN="${INFLUX_TOKEN:-}"  # required; pass via env or Jenkins secret
 
-# -----------------------------------------------------------------------------
-# Helper function
-# -----------------------------------------------------------------------------
-function query_influx() {
+# --- Sanity checks --------------------------------------------------------------
+if ! command -v curl >/dev/null 2>&1; then
+  echo "ERROR: curl not found in PATH." >&2
+  exit 1
+fi
+
+if [[ -z "$INFLUX_TOKEN" ]]; then
+  echo "ERROR: INFLUX_TOKEN not set." >&2
+  echo "Set it with: export INFLUX_TOKEN='your_token_here'" >&2
+  exit 1
+fi
+
+if [[ -z "$INFLUX_URL" || -z "$INFLUX_ORG" || -z "$INFLUX_BUCKET" ]]; then
+  echo "ERROR: INFLUX_URL/INFLUX_ORG/INFLUX_BUCKET must not be empty." >&2
+  exit 1
+fi
+
+# --- Helper --------------------------------------------------------------------
+query_influx() {
   local measurement=$1
   local field=$2
   local label=$3
 
   echo
-  echo "Querying latest $label data..."
+  echo "Querying latest ${label} data..."
   echo "-------------------------------------------"
 
-  curl -sS "${INFLUX_URL}/api/v2/query?org=${INFLUX_ORG}" \
+  # --fail makes curl exit non-zero on HTTP >=400 (prevents false success)
+  # timeouts prevent hanging
+  curl --fail -sS \
+    --connect-timeout 5 --max-time 20 \
+    "${INFLUX_URL}/api/v2/query?org=${INFLUX_ORG}" \
     -H "Authorization: Token ${INFLUX_TOKEN}" \
     -H "Accept: application/csv" \
     -H "Content-Type: application/vnd.flux" \
@@ -36,26 +58,17 @@ from(bucket: "${INFLUX_BUCKET}")
 EOF
 }
 
-# -----------------------------------------------------------------------------
-# MAIN EXECUTION
-# -----------------------------------------------------------------------------
-if [[ -z "$INFLUX_TOKEN" ]]; then
-  echo "ERROR: INFLUX_TOKEN not set."
-  echo "You can export it like this:"
-  echo "  export INFLUX_TOKEN='your_token_here'"
-  exit 1
-fi
-
+# --- Main ----------------------------------------------------------------------
 echo "Checking InfluxDB data..."
-echo "InfluxDB URL  : $INFLUX_URL"
-echo "Organization  : $INFLUX_ORG"
-echo "Bucket        : $INFLUX_BUCKET"
+echo "InfluxDB URL  : ${INFLUX_URL}"
+echo "Organization  : ${INFLUX_ORG}"
+echo "Bucket        : ${INFLUX_BUCKET}"
 echo
 
-# --- CPU ---
+# CPU
 query_influx "netdata_cpu" "used_percent" "CPU used%"
 
-# --- RAM ---
+# RAM
 query_influx "netdata_mem" "used_bytes" "RAM used bytes"
 
 echo

@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Verify NFS exports (v4.2) from k3s nodes using temp mounts + UID/GID write tests
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 - name: Verify NFS exports (NFSv4.2) on all k3s nodes
   hosts: k3s_server,k3s_workers
@@ -7,6 +13,9 @@
     - "{{ playbook_dir }}/../vars.yml"
 
   vars:
+    # Force Ansible to use your controller SSH key for these hosts
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
+
     nfs_server_ip: "{{ NFS_SERVER_IP }}"
     export_root: "{{ NFS_MOUNTPOINT }}"
 

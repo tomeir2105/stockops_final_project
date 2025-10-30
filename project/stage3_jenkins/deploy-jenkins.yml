@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Deploy Jenkins on k3s using NFS PV (ensure correct SSH key usage)
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 # deploy-jenkins.yml — uses APP_DIRS only (no asserts, no defaults)
 
@@ -11,6 +17,8 @@
     - "{{ playbook_dir }}/../vars.yml"
 
   vars:
+    # Force Ansible to use the controller SSH key
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
     # Pick the APP_DIRS row for Jenkins
     jenkins_dir: "{{ (APP_DIRS | selectattr('path','search','/jenkins$') | list | first) }}"
 
@@ -23,6 +31,7 @@
         group: "{{ jenkins_dir.group }}"
         mode: "{{ jenkins_dir.mode }}"
         recurse: yes
+
     - name: Ensure Jenkins NFS directory has correct owner/group/mode (from vars.yml)
       ansible.builtin.file:
         path: "{{ jenkins_dir.path }}"
@@ -40,10 +49,13 @@
   become: yes
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
+
   vars:
+    # Force Ansible to use the controller SSH key on k3s servers as well
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
     workdir: "/tmp/jenkins"
     jenkins_sa: "jenkins-sa"
-    # re-derive here for this play's scope
+    # Re-derive here for this play's scope
     jenkins_dir: "{{ (APP_DIRS | selectattr('path','search','/jenkins$') | list | first) }}"
 
   environment:
@@ -156,7 +168,6 @@
               spec:
                 serviceAccountName: {{ jenkins_sa }}
                 securityContext:
-                  # Use numeric group from APP_DIRS as fsGroup
                   fsGroup: {{ jenkins_dir.group | int }}
                 containers:
                   - name: jenkins
@@ -230,9 +241,9 @@
               def password = '{{ JENKINS_ADMIN_PASS }}'
               user.addProperty(new hudson.security.HudsonPrivateSecurityRealm.Details(password))
               user.save()
-              println '✅ Updated Jenkins password for {{ JENKINS_ADMIN_USER }}'
+              println 'Updated Jenkins password for {{ JENKINS_ADMIN_USER }}'
           } else {
-              println '⚠️  Jenkins user {{ JENKINS_ADMIN_USER }} not found'
+              println 'Jenkins user {{ JENKINS_ADMIN_USER }} not found'
           }
           GROOVY
           java -jar /usr/share/jenkins/jenkins.war groovy /tmp/set-pass.groovy
@@ -250,5 +261,4 @@
         msg:
           - "Jenkins → {{ JENKINS_URL }}"
           - "{{ svc_out.stdout }}"
-
 

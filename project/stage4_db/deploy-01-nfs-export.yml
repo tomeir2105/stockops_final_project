@@ -1,3 +1,10 @@
+######################################
+# Created by : Meir
+# Purpose    : Configure NFS export for observability data (Grafana/InfluxDB) on the NFS server
+# Date       : 2025-10-30
+# Version    : 1
+######################################
+
 ---
 - name: "Configure NFS export for observability data"
   hosts: nfs_server

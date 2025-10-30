@@ -17,7 +17,8 @@ HOSTS_GROUPS:
   - k3s_workers
 
 # Controller (k3srouter_host) SSH file paths
-CONTROLLER_KEY_PATH: /home/user/.ssh/ansible_ed25519
+CONTROLLER_KEY_PATH: "/home/user/.ssh/id_ed25519"
+CONTROLLER_PUBKEY_PATH: "/home/user/.ssh/id_ed25519.pub"
 CONTROLLER_KNOWN_HOSTS_PATH: /home/user/.ssh/known_hosts
 
 # ─────────────────────────────────────────────────────────────────────────────

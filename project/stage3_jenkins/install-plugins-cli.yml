@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Install Jenkins plugins (via jenkins-plugin-cli) into LIVE JENKINS_HOME/plugins, restart, and verify
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
 # Install plugins (and deps) into LIVE $JENKINS_HOME/plugins, fix ownership, restart, verify, and print diagnostics.
 
@@ -10,9 +16,11 @@
     - "{{ playbook_dir }}/../vars.yml"  # needs: JENKINS_PLUGINS, JENKINS_API_PORT, JENKINS_ADMIN_USER, JENKINS_ADMIN_PASS, optional JENKINS_SAFE_RESTART
 
   vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"   # ensure correct SSH key
     kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
-    test_plugins: "{{ (JENKINS_PLUGINS | default([])) | join(' ') }}"
     do_restart: "{{ JENKINS_SAFE_RESTART | default(true) }}"
+    # Build a *properly quoted* space-separated argument list for the CLI:
+    plugins_args: "{{ (JENKINS_PLUGINS | default([])) | map('quote') | join(' ') }}"
 
   environment:
     KUBECONFIG: "{{ kubeconfig_path }}"
@@ -49,6 +57,7 @@
           - "Namespace: {{ jns }}"
           - "Pod: {{ jpod }}"
           - "Requested plugins: {{ JENKINS_PLUGINS | join(', ') }}"
+          - "CLI args: {{ plugins_args }}"
 
     - name: Verify jenkins-plugin-cli is available
       shell: >
@@ -86,11 +95,11 @@
       register: home_owner
       changed_when: false
 
-    - name: Install requested plugins (and deps) into LIVE dir
+    - name: Install requested plugins (and deps) into LIVE dir (correctly split)
       shell: >
         {{ kubectl_cmd.stdout }} -n "{{ jns }}" exec -i "{{ jpod }}" -- bash -lc
         'set -euo pipefail; PATH=/opt/java/openjdk/bin:$PATH
-         jenkins-plugin-cli --plugins "{{ test_plugins }}" --plugin-download-directory "{{ live_plugins_dir }}" --verbose'
+         jenkins-plugin-cli --plugins {{ plugins_args }} --plugin-download-directory "{{ live_plugins_dir }}" --verbose'
       args: { executable: /bin/bash }
       register: install_out
       changed_when: true
@@ -147,7 +156,7 @@
       args: { executable: /bin/bash }
       register: wait_out
       changed_when: false
-      failed_when: "'condition met' not in wait_out.stdout"
+      failed_when: "'condition met' not in (wait_out.stdout | default(''))"
 
     - name: Fetch installed plugins JSON (verify on live instance)
       shell: >

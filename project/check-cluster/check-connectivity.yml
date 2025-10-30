@@ -1,41 +1,61 @@
+######################################
+# Created by : Meir
+# Purpose    : Check routing, external IP, DNS, and HTTPS on all k3s nodes
+# Date       : 2025-10-30
+# Version    : 1
+######################################
 ---
-# check-connectivity.yml — Verify network, DNS, and routing on all cluster nodes
-
 - name: Check k3s cluster connectivity
-  hosts: k3s
-  gather_facts: no
-  become: yes
-  tasks:
+  hosts: k3s_server:k3s_workers
+  gather_facts: false
+  become: true
 
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
+
+  tasks:
     - name: Check default route exists
-      command: ip route show default
+      ansible.builtin.command: ip route show default
       register: route_out
       changed_when: false
-      failed_when: route_out.rc != 0
-    - debug:
-        msg: "Default route: {{ route_out.stdout }}"
+      failed_when:
+        - route_out.rc != 0
+        - route_out.stdout is not search("(^|\\s)default\\s")
+
+    - name: Show default route
+      ansible.builtin.debug:
+        msg: "Default route: {{ route_out.stdout | default('N/A') }}"
 
     - name: Check external IP connectivity (ping 8.8.8.8)
-      command: ping -c 3 8.8.8.8
-      register: ping_ip
+      ansible.builtin.command: ping -c 3 -W 2 8.8.8.8
+      register: ping_out
       changed_when: false
-      failed_when: ping_ip.rc != 0
-    - debug:
-        msg: "Ping 8.8.8.8 output: {{ ping_ip.stdout_lines }}"
+      failed_when: ping_out.rc != 0
+
+    - name: Show ping output
+      ansible.builtin.debug:
+        msg: "Ping 8.8.8.8 output: {{ ping_out.stdout_lines }}"
 
     - name: Check DNS resolution (google.com)
-      command: getent hosts google.com
+      ansible.builtin.command: getent hosts google.com
       register: dns_out
       changed_when: false
       failed_when: dns_out.rc != 0
-    - debug:
-        msg: "DNS resolution for google.com: {{ dns_out.stdout }}"
+
+    - name: Show DNS resolution
+      ansible.builtin.debug:
+        msg: "DNS resolution for google.com: {{ (dns_out.stdout_lines | first) | default('N/A') }}"
 
     - name: Check HTTPS connectivity
-      command: curl -I -s https://www.google.com
+      ansible.builtin.command: curl -sSI https://www.google.com
       register: https_out
       changed_when: false
       failed_when: https_out.rc != 0
-    - debug:
-        msg: "HTTPS check: {{ https_out.stdout_lines | default('no output') }}"
+
+    - name: Show HTTPS headers
+      ansible.builtin.debug:
+        msg: "HTTPS check: {{ https_out.stdout_lines }}"
 

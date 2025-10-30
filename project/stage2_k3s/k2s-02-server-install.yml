@@ -3,7 +3,10 @@
 - name: Install k3s server if missing
   hosts: k3s_server
   become: yes
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
   vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"  # force key
     k3s_server_ip: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
     k3s_async_timeout: 1800   # 30m
     k3s_poll_interval: 10

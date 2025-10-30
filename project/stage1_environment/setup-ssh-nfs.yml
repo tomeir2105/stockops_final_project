@@ -1,32 +1,32 @@
+######################################
+# Created by : Meir
+# Purpose : Prepare SSH on controller, authorize controller key on nodes, write /etc/hosts, and configure NFS — without duplicates
+# Date : 2025-10-30
+# Version : 1
+######################################
 ---
-# setup-ssh-nfs.yml — Stage 0/1/2 with resilient ssh-keyscan (no loop-on-block) + clean NFS setup
-
 ###############################################################################
-# STAGE 0 — Preflight on controller (keys, known_hosts)
+# STAGE 0 — SSH | Prepare controller (keys, known_hosts)
 ###############################################################################
 - name: Stage 0 — SSH | Prepare controller (keys, known_hosts)
   hosts: k3srouter_host
-  gather_facts: false
+  gather_facts: true
   become: false
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
 
   pre_tasks:
-    - name: Assert required SSH vars exist
-      assert:
-        that:
-          - CONTROLLER_KEY_PATH is defined
-          - CONTROLLER_KEY_PATH | length > 0
-          - CONTROLLER_KNOWN_HOSTS_PATH is defined
-          - CONTROLLER_KNOWN_HOSTS_PATH | length > 0
-        fail_msg: "Missing one or more required SSH vars (CONTROLLER_KEY_PATH, CONTROLLER_KNOWN_HOSTS_PATH)."
+    - name: Default controller SSH paths when undefined
+      set_fact:
+        CONTROLLER_KEY_PATH: "{{ CONTROLLER_KEY_PATH | default(ansible_env.HOME + '/.ssh/id_ed25519') }}"
+        CONTROLLER_KNOWN_HOSTS_PATH: "{{ CONTROLLER_KNOWN_HOSTS_PATH | default(ansible_env.HOME + '/.ssh/known_hosts') }}"
 
     - name: Derive controller ssh dir
       set_fact:
         CONTROLLER_SSH_DIR: "{{ CONTROLLER_KEY_PATH | regex_replace('/[^/]+$','') }}"
 
   tasks:
-    - name: Ensure openssh-client (ssh-keyscan) is installed on controller
+    - name: Ensure openssh-client is installed on controller
       become: true
       package:
         name: openssh-client
@@ -51,12 +51,11 @@
         state: present
         mode: "0600"
 
-    # ---- Resilient key scan: try all common types in one call; never fail the play ----
-    - name: Build list of hosts to scan
+    - name: Build list of hosts to scan (from inventory group ssh_scan_hosts)
       set_fact:
         _ssh_scan_hosts: "{{ groups['ssh_scan_hosts'] | default([]) }}"
 
-    - name: ssh-keyscan for all supported types (hashed hostnames)
+    - name: ssh-keyscan (hashed) for ed25519, ecdsa, rsa
       command: "ssh-keyscan -T 5 -H -t ed25519,ecdsa,rsa {{ item }}"
       register: _scan_results
       changed_when: false
@@ -76,16 +75,8 @@
       loop_control:
         label: "{{ item.item }}"
 
-    - name: Report hosts with no discoverable host key
-      when: (item.stdout | default('') | trim) == ''
-      debug:
-        msg: "Skipped adding known_hosts for {{ item.item }} (no key found via ssh-keyscan)."
-      loop: "{{ _scan_results.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-
 ###############################################################################
-# STAGE 1 — Install controller key on nodes + /etc/hosts block
+# STAGE 1 — SSH | Authorize controller public key on nodes
 ###############################################################################
 - name: Stage 1 — SSH | Install controller public key on nodes
   hosts: k3s_server:k3s_workers
@@ -93,29 +84,47 @@
   become: true
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
+  vars:
+    # Ensure Ansible uses the same key you use manually
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
 
   pre_tasks:
-    - name: Assert TARGET_USER exists
-      assert:
-        that:
-          - TARGET_USER is defined
-          - TARGET_USER | length > 0
-        fail_msg: "Missing TARGET_USER."
+    # Derive target user from inventory
+    - name: Derive target user from inventory (ansible_user)
+      set_fact:
+        TARGET_USER: "{{ hostvars[inventory_hostname].ansible_user | default('user') }}"
 
-    - name: Ensure controller pubkey exists and readable (run on controller)
+    # --- New: connectivity pre-check with friendly fallback ---
+    - name: Precheck SSH connectivity to {{ inventory_hostname }}
+      block:
+        - name: Wait for SSH connectivity (quick check)
+          wait_for_connection:
+            timeout: 5
+      rescue:
+        - name: Hint — bootstrap keys with add-keys.sh from its folder, then re-run playbook
+          debug:
+            msg: >
+              SSH to {{ inventory_hostname }} ({{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}) failed.
+              To bootstrap keys once, run:
+              cd /home/user/stockops_final_project/rpi-wifi-router &&
+              ./add-keys.sh -u {{ TARGET_USER }}
+              -H {{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}
+        - meta: end_host
+
+    # Ensure controller pubkey exists/slurp once on controller
+    - name: Check controller public key exists (on controller)
       stat:
         path: "{{ CONTROLLER_KEY_PATH }}.pub"
       register: _pub
       delegate_to: "{{ groups['k3srouter_host'][0] }}"
       run_once: true
 
-    - name: Fail if pubkey missing
+    - name: Fail if controller public key missing
+      when: not _pub.stat.exists
       fail:
         msg: "Controller public key {{ CONTROLLER_KEY_PATH }}.pub not found."
-      when: not _pub.stat.exists
-      run_once: true
 
-    - name: Slurp controller public key (run on controller)
+    - name: Read controller public key once (on controller)
       slurp:
         src: "{{ CONTROLLER_KEY_PATH }}.pub"
       register: _pubkey
@@ -123,14 +132,29 @@
       run_once: true
 
   tasks:
+    # Try to authorize the key; on any failure, print the add-keys hint for this host
     - name: Authorize controller public key (idempotent, no duplicates)
-      ansible.posix.authorized_key:
-        user: "{{ TARGET_USER }}"
-        key: "{{ _pubkey.content | b64decode }}"
-        state: present
-        manage_dir: true
+      block:
+        - ansible.posix.authorized_key:
+            user: "{{ TARGET_USER }}"
+            key: "{{ _pubkey.content | b64decode }}"
+            state: present
+            manage_dir: true
+      rescue:
+        - name: Hint — bootstrap keys with add-keys.sh from its folder, then re-run playbook
+          debug:
+            msg: >
+              Authorizing key on {{ inventory_hostname }} failed.
+              From the controller, run:
+              cd /home/user/stockops_final_project/rpi-wifi-router &&
+              ./add-keys.sh -u {{ TARGET_USER }}
+              -H {{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}
+        - meta: end_host
 
-- name: Stage 1 — SSH | Write unified /etc/hosts block (router + servers + workers)
+###############################################################################
+# STAGE 1B — SSH | Unified /etc/hosts block
+###############################################################################
+- name: Stage 1B — SSH | Write unified /etc/hosts block (router + servers + workers)
   hosts: k3srouter_host:k3s_server:k3s_workers
   gather_facts: false
   become: true
@@ -138,31 +162,9 @@
     - "{{ playbook_dir }}/../vars.yml"
 
   pre_tasks:
-    - name: Assert HOSTS_GROUPS is defined and non-empty
-      assert:
-        that:
-          - HOSTS_GROUPS is defined
-          - HOSTS_GROUPS | length > 0
-        fail_msg: "Missing HOSTS_GROUPS (list of group names for /etc/hosts)."
-
-    - name: Assert all listed groups exist in inventory
-      assert:
-        that: "{{ item in groups }}"
-        fail_msg: "Group '{{ item }}' not found in inventory."
-      loop: "{{ HOSTS_GROUPS }}"
-
-    - name: Build ordered unique host list from HOSTS_GROUPS
+    - name: Build ordered unique host list (router, server, workers)
       set_fact:
-        _all_nodes: "{{ (HOSTS_GROUPS | map('extract', groups) | list) | flatten | unique }}"
-
-    - name: Assert each host has ansible_host defined
-      assert:
-        that:
-          - hostvars[item].ansible_host is defined
-          - hostvars[item].ansible_host | length > 0
-        fail_msg: "Host '{{ item }}' is missing ansible_host."
-      loop: "{{ _all_nodes }}"
-      run_once: true
+        _all_nodes: "{{ (['k3srouter_host','k3s_server','k3s_workers'] | map('extract', groups) | list) | flatten | unique }}"
 
   tasks:
     - name: Write managed /etc/hosts block exactly once
@@ -176,7 +178,7 @@
           {% endfor %}
 
 ###############################################################################
-# STAGE 2 — NFS server: folder-only export + verify
+# STAGE 2 — NFS | Configure NFS server (folder-only)
 ###############################################################################
 - name: Stage 2 — NFS | Configure NFS server (folder-only)
   hosts: k3srouter_host
@@ -186,20 +188,10 @@
     - "{{ playbook_dir }}/../vars.yml"
 
   vars:
-    NFS_MOUNTPOINT: "{{ lookup('vars', 'NFS_MOUNTPOINT') }}"
-    NFS_EXPORTS_FILE: "{{ lookup('vars', 'NFS_EXPORTS_FILE') }}"
-    NFS_ALLOWED_CIDR: "{{ lookup('vars', 'NFS_ALLOWED_CIDR') }}"
-    NFS_EXPORT_OPTS: "{{ lookup('vars', 'NFS_EXPORT_OPTS') }}"
-
-  pre_tasks:
-    - name: Assert minimal NFS vars exist
-      assert:
-        that:
-          - NFS_MOUNTPOINT is defined and NFS_MOUNTPOINT | length > 0
-          - NFS_EXPORTS_FILE is defined and NFS_EXPORTS_FILE | length > 0
-          - NFS_ALLOWED_CIDR is defined and NFS_ALLOWED_CIDR | length > 0
-          - NFS_EXPORT_OPTS is defined and NFS_EXPORT_OPTS | length > 0
-        fail_msg: "Missing one or more required NFS vars (NFS_MOUNTPOINT, NFS_EXPORTS_FILE, NFS_ALLOWED_CIDR, NFS_EXPORT_OPTS)."
+    NFS_MOUNTPOINT: "{{ NFS_MOUNTPOINT }}"
+    NFS_EXPORTS_FILE: "{{ NFS_EXPORTS_FILE }}"
+    NFS_ALLOWED_CIDR: "{{ NFS_ALLOWED_CIDR }}"
+    NFS_EXPORT_OPTS: "{{ NFS_EXPORT_OPTS }}"
 
   tasks:
     - name: Remove any fstab entry that mounts /mnt/k3s_storage from a device/label/uuid
@@ -239,6 +231,13 @@
         group: "{{ item.group }}"
         mode: "{{ item.mode }}"
       loop: "{{ APP_DIRS | default([]) }}"
+    - name: Ensure exports.d directory exists
+      file:
+        path: "{{ NFS_EXPORTS_FILE | dirname }}"
+        state: directory
+        owner: "root"
+        group: "root"
+        mode: "0755"
 
     - name: Write a single authoritative exports.d file
       copy:

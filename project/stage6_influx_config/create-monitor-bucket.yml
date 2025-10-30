@@ -1,0 +1,341 @@
+######################################
+# Created by : Meir
+# Purpose    : Ensure InfluxDB v2 org & bucket for monitoring (idempotent).
+#              Prefer INFLUXDB_URL if reachable; otherwise auto-fallback to
+#              kubectl port-forward on k3s_server (svc/influxdb → 127.0.0.1:PF).
+# Date       : 2025-10-30
+# Version    : 8
+######################################
+---
+# project/stage6_influx_config/create-monitor-bucket.yml
+
+- name: Ensure InfluxDB org & bucket (monitor org; direct URL with automatic PF fallback)
+  hosts: k3s_server
+  gather_facts: false
+  become: false
+  vars_files:
+    - "{{ playbook_dir }}/../vars.yml"
+
+  vars:
+    ns: "{{ NAMESPACE | default('default') }}"
+    org_name: "{{ MONITOR_ORG | default('monitor') }}"
+    bucket_name: "{{ MONITOR_BUCKET | default('k3s_pods_1w') }}"
+    retention_seconds: "{{ 604800 }}"     # 1 week
+    influx_url_cfg: "{{ INFLUXDB_URL | default('') }}"  # may be a cluster DNS (often not resolvable from node)
+    influx_token: "{{ MONITOR_TOKEN | default(INFLUXDB_ADMIN_TOKEN, true) | default('', true) }}"
+
+    # Port-forward settings (used when direct URL is absent OR not reachable)
+    pf_port: 18086
+    pf_pidfile: "/tmp/pf_influx_monitor_{{ ns }}.pid"
+
+    # Initial decision: try direct URL if provided; otherwise plan PF
+    use_direct_url: "{{ influx_url_cfg | length > 0 }}"
+    influx_url_eff: >-
+      {{ influx_url_cfg if use_direct_url else ('http://127.0.0.1:' ~ pf_port|string) }}
+
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"
+  environment:
+    KUBECONFIG: "{{ KUBECONFIG | default('') }}"
+
+  tasks:
+    - block:
+        - name: Validate required inputs (token/org/bucket)
+          ansible.builtin.assert:
+            that:
+              - influx_token | length > 0
+              - org_name | length > 0
+              - bucket_name | length > 0
+            fail_msg: >
+              Missing settings. Ensure MONITOR_TOKEN (or INFLUXDB_ADMIN_TOKEN),
+              MONITOR_ORG and MONITOR_BUCKET are provided.
+
+        - name: Show initial settings (token hidden)
+          ansible.builtin.debug:
+            msg:
+              - "Direct URL provided: {{ influx_url_cfg | ternary('yes','no') }}"
+              - "Namespace: {{ ns }}"
+              - "Org: {{ org_name }}"
+              - "Bucket: {{ bucket_name }}"
+              - "Retention (seconds): {{ retention_seconds }}"
+              - "Initial effective URL: {{ influx_url_eff }}"
+
+        # ---------- Try direct URL if provided; do NOT fail hard yet ----------
+        - name: Probe /health on DIRECT URL (soft check)
+          ansible.builtin.uri:
+            url: "{{ influx_url_cfg }}/health"
+            method: GET
+            return_content: true
+            status_code: 200
+            timeout: 8
+          register: health_direct
+          failed_when: false
+          changed_when: false
+          when: use_direct_url
+
+        - name: Decide if direct URL is OK
+          ansible.builtin.set_fact:
+            direct_ok: "{{ use_direct_url and (health_direct.status | default(0) | int) == 200 }}"
+          when: use_direct_url
+
+        - name: Log direct URL probe result
+          ansible.builtin.debug:
+            msg:
+              - "Direct URL probe status: {{ (health_direct.status | default('N/A')) if use_direct_url else 'skipped' }}"
+              - "Direct URL reachable: {{ direct_ok | default(false) }}"
+          when: use_direct_url
+
+        # ---------- If direct URL is not OK (or not provided), start PF ----------
+        - name: Start port-forward on k3s_server (svc/influxdb → {{ pf_port }}) when needed
+          ansible.builtin.shell: |
+            set -Eeuo pipefail
+            if [ -f "{{ pf_pidfile }}" ]; then
+              oldpid="$(cat {{ pf_pidfile }} || true)"
+              if [ -n "$oldpid" ] && ! ps -p "$oldpid" >/dev/null 2>&1; then
+                rm -f "{{ pf_pidfile }}"
+              fi
+            fi
+            if [ -f "{{ pf_pidfile }}" ]; then
+              exit 0
+            fi
+            nohup kubectl -n "{{ ns }}" port-forward svc/influxdb {{ pf_port }}:8086 \
+              > /tmp/pf_influx_monitor_{{ ns }}.log 2>&1 &
+            echo $! > "{{ pf_pidfile }}"
+          args: { executable: /bin/bash }
+          changed_when: false
+          when: not use_direct_url or not direct_ok | default(false)
+
+        - name: Switch to PF effective URL when direct is absent/unreachable
+          ansible.builtin.set_fact:
+            influx_url_eff: "http://127.0.0.1:{{ pf_port }}"
+          when: not use_direct_url or not direct_ok | default(false)
+
+        - name: Wait for PF local port (if using PF)
+          ansible.builtin.wait_for:
+            host: "127.0.0.1"
+            port: "{{ pf_port }}"
+            delay: 0
+            timeout: 30
+          when: not use_direct_url or not direct_ok | default(false)
+
+        # ---------- Final health check on effective URL (must succeed) ----------
+        - name: Compute retention rule payload
+          ansible.builtin.set_fact:
+            retention_rules: >-
+              {{
+                [] if (retention_seconds | int) <= 0 else
+                [ { "type": "expire", "everySeconds": (retention_seconds | int) } ]
+              }}
+
+        - name: Check /health on EFFECTIVE URL (required OK)
+          ansible.builtin.uri:
+            url: "{{ influx_url_eff }}/health"
+            method: GET
+            return_content: true
+            status_code: 200
+            timeout: 12
+          register: health_final
+
+        - name: Debug effective health result
+          ansible.builtin.debug:
+            msg:
+              - "Using URL: {{ influx_url_eff }}"
+              - "Health status: {{ health_final.status }}"
+              - "Health content: {{ (health_final.json | default({})).status | default('n/a') }}"
+
+        # ---------------------- ORG: lookup → create if missing ----------------------
+        - name: Lookup org by exact name
+          ansible.builtin.uri:
+            url: "{{ influx_url_eff }}/api/v2/orgs?name={{ org_name | urlencode }}"
+            method: GET
+            headers:
+              Authorization: "Token {{ influx_token }}"
+              Accept: "application/json"
+            return_content: true
+            status_code: [200]
+          register: org_lookup
+
+        - name: Normalize candidate orgs (exact-name match)
+          ansible.builtin.set_fact:
+            _org_candidates: >-
+              {{
+                (org_lookup.json.orgs | default([]))
+                | selectattr('name','equalto', org_name) | list
+              }}
+
+        - name: Extract org_id if present (safe)
+          ansible.builtin.set_fact:
+            org_id: "{{ (_org_candidates | first | default({})).id | default(None) }}"
+
+        - name: Debug — show org match state
+          ansible.builtin.debug:
+            msg:
+              - "Found orgs count: {{ _org_candidates | length }}"
+              - "org_id (pre-create): {{ org_id | default('None') }}"
+
+        - name: Create org if missing
+          ansible.builtin.uri:
+            url: "{{ influx_url_eff }}/api/v2/orgs"
+            method: POST
+            headers:
+              Authorization: "Token {{ influx_token }}"
+              Content-Type: "application/json"
+              Accept: "application/json"
+            body_format: json
+            body:
+              name: "{{ org_name }}"
+            return_content: true
+            status_code: [201, 401, 403, 409]
+          register: org_create
+          when: org_id is not defined or org_id is none
+          changed_when: org_create.status | int == 201
+
+        - name: Fail if org create was unauthorized
+          ansible.builtin.fail:
+            msg: >-
+              Failed to create org '{{ org_name }}': HTTP {{ org_create.status }} (token lacks permissions).
+              Use MONITOR_TOKEN with org-level permissions.
+          when:
+            - org_id is not defined or org_id is none
+            - org_create.status is defined
+            - org_create.status | int in [401, 403]
+
+        - name: Use created org_id when new org was created (safe)
+          ansible.builtin.set_fact:
+            org_id: "{{ (org_create | default({})).get('json', {}).get('id', org_id) }}"
+          when: org_create is defined
+
+        - name: Ensure org_id is resolved
+          ansible.builtin.assert:
+            that:
+              - org_id is defined
+              - org_id is not none
+              - org_id | length > 0
+            fail_msg: "Unable to resolve org_id for '{{ org_name }}'."
+
+        # ------------------- BUCKET: lookup (200/404) → create/patch -----------------
+        - name: Lookup bucket by name within org
+          ansible.builtin.uri:
+            url: "{{ influx_url_eff }}/api/v2/buckets?name={{ bucket_name | urlencode }}&orgID={{ org_id }}"
+            method: GET
+            headers:
+              Authorization: "Token {{ influx_token }}"
+              Accept: "application/json"
+            return_content: true
+            status_code: [200, 404]
+          register: bucket_lookup
+
+        - name: Determine if bucket exists
+          ansible.builtin.set_fact:
+            bucket_exists: >-
+              {{
+                False if (bucket_lookup.status | default(0)) == 404
+                else ((bucket_lookup.json.buckets | default([]) | length) > 0)
+              }}
+
+        - name: Create bucket if missing
+          ansible.builtin.uri:
+            url: "{{ influx_url_eff }}/api/v2/buckets"
+            method: POST
+            headers:
+              Authorization: "Token {{ influx_token }}"
+              Content-Type: "application/json"
+              Accept: "application/json"
+            body_format: json
+            body:
+              name: "{{ bucket_name }}"
+              orgID: "{{ org_id }}"
+              retentionRules: "{{ retention_rules }}"
+            status_code: [201, 409, 401, 403]
+            return_content: true
+          register: create_attempt
+          when: not bucket_exists
+          changed_when: create_attempt.status | int == 201
+
+        - name: Fail if create was unauthorized (use a monitor-scoped token)
+          ansible.builtin.fail:
+            msg: >-
+              Failed to create bucket '{{ bucket_name }}' in org '{{ org_name }}':
+              HTTP {{ create_attempt.status }} (token lacks permissions).
+              Use a token scoped to org '{{ org_name }}' with buckets read/write.
+          when:
+            - not bucket_exists
+            - create_attempt.status is defined
+            - create_attempt.status | int in [401, 403]
+
+        - name: Re-fetch bucket after create (or if existed) to get final retention
+          ansible.builtin.uri:
+            url: "{{ influx_url_eff }}/api/v2/buckets?name={{ bucket_name | urlencode }}&orgID={{ org_id }}"
+            method: GET
+            headers:
+              Authorization: "Token {{ influx_token }}"
+              Accept: "application/json"
+            return_content: true
+            status_code: [200]
+          register: bucket_final
+
+        - name: Extract final bucket info
+          ansible.builtin.set_fact:
+            bucket_id: "{{ (bucket_final.json.buckets | default([]) | map(attribute='id') | list | first) | default('') }}"
+            final_retention: >-
+              {{
+                (
+                  ((bucket_final.json.buckets | default([]) | first) | default({})).retentionRules
+                  | default([]) | first | default({})
+                ).everySeconds | default(0) | int
+              }}
+
+        - name: Assert bucket_id resolved
+          ansible.builtin.assert:
+            that:
+              - bucket_id | length > 0
+            fail_msg: "Bucket '{{ bucket_name }}' not resolved after creation/lookup."
+
+        - name: Update retention if different (handle auth errors)
+          ansible.builtin.uri:
+            url: "{{ influx_url_eff }}/api/v2/buckets/{{ bucket_id }}"
+            method: PATCH
+            headers:
+              Authorization: "Token {{ influx_token }}"
+              Content-Type: "application/json"
+              Accept: "application/json"
+            body_format: json
+            body:
+              retentionRules: "{{ retention_rules }}"
+            status_code: [200, 401, 403]
+          register: patch_attempt
+          when:
+            - (final_retention | int) != (retention_seconds | int)
+          changed_when: patch_attempt.status | int == 200
+
+        - name: Fail if patch was unauthorized (use a monitor-scoped token)
+          ansible.builtin.fail:
+            msg: >-
+              Failed to update retention on bucket '{{ bucket_name }}' in org '{{ org_name }}':
+              HTTP {{ patch_attempt.status }} (token lacks permissions).
+          when:
+            - (final_retention | int) != (retention_seconds | int)
+            - patch_attempt.status is defined
+            - patch_attempt.status | int in [401, 403]
+
+        - name: Success summary
+          ansible.builtin.debug:
+            msg:
+              - "Influx URL (effective on k3s1): {{ influx_url_eff }}"
+              - "Org: {{ org_name }} (id: {{ org_id }})"
+              - "Bucket: {{ bucket_name }} (id: {{ bucket_id }})"
+              - "Retention (seconds): {{ retention_seconds }}"
+      always:
+        - name: Cleanup port-forward on k3s_server if we started it
+          ansible.builtin.shell: |
+            set -Eeuo pipefail
+            if [ -f "{{ pf_pidfile }}" ]; then
+              pid="$(cat {{ pf_pidfile }} || true)"
+              if [ -n "$pid" ]; then
+                kill "$pid" 2>/dev/null || true
+              fi
+              rm -f "{{ pf_pidfile }}"
+            fi
+          args: { executable: /bin/bash }
+          changed_when: false
+          when: not use_direct_url or not direct_ok | default(false)
+

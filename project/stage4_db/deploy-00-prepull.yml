@@ -1,3 +1,9 @@
+######################################
+# Created by : Meir
+# Purpose    : Configure registries and pre-pull images for observability on k3s nodes
+# Date       : 2025-10-30
+# Version    : 4
+######################################
 ---
 - name: Configure registries and pre-pull images for observability
   hosts: k3s
@@ -5,10 +11,14 @@
   gather_facts: no
   vars_files:
     - "{{ playbook_dir }}/../vars.yml"
-    - "{{ playbook_dir }}/../group_vars/dockerhub.yml"
+    - "{{ playbook_dir }}/../group_vars/dockerhub.yml"  # defines DOCKERHUB_USER / DOCKERHUB_TOKEN
+  vars:
+    ansible_ssh_private_key_file: "{{ CONTROLLER_KEY_PATH }}"   # use controller SSH key
+    # Map your existing vars to the names used later in the template/content
+    dockerhub_username: "{{ DOCKERHUB_USER  | default('') }}"
+    dockerhub_password: "{{ DOCKERHUB_TOKEN | default('') }}"
 
   pre_tasks:
-    # --- Detect k3s unit (server or agent) and ensure it's running ---
     - name: Detect k3s systemd unit (server or agent)
       ansible.builtin.shell: |
         set -e
@@ -24,7 +34,7 @@
       changed_when: false
 
     - name: Set fact for k3s unit
-      set_fact:
+      ansible.builtin.set_fact:
         k3s_unit: "{{ detect_unit.stdout | trim }}"
 
     - name: Start k3s service if available
@@ -44,12 +54,20 @@
         timeout: 90
       when: k3s_unit != "none"
 
-    # --- Write a minimal registries.yaml for auth (if you rely on Docker Hub rate-limit/auth) ---
     - name: Ensure /etc/rancher/k3s exists
       ansible.builtin.file:
         path: /etc/rancher/k3s
         state: directory
         mode: "0755"
+      when: k3s_unit != "none"
+
+    - name: Assert Docker Hub creds are provided (or skip if you want anonymous pulls)
+      ansible.builtin.assert:
+        that:
+          - dockerhub_username | length > 0
+          - dockerhub_password | length > 0
+        fail_msg: "Set DOCKERHUB_USER/DOCKERHUB_TOKEN (or edit playbook to allow anonymous pulls)."
+      when: k3s_unit != "none"
 
     - name: Configure Docker Hub auth (registries.yaml)
       ansible.builtin.copy:
@@ -66,6 +84,8 @@
                 username: "{{ dockerhub_username }}"
                 password: "{{ dockerhub_password }}"
       register: regfile
+      no_log: true
+      when: k3s_unit != "none"
 
     - name: Restart k3s to pick up registries.yaml (if file changed and unit exists)
       ansible.builtin.service:
